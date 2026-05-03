@@ -32,9 +32,20 @@ type DistorterBot struct {
 	graceWg     *sync.WaitGroup
 	videoWorker *tools.VideoWorker
 	codec       string
+	db          *stats.DistortionerDB
 }
 
-func (d DistorterBot) handleAnimationDistortion(c tb.Context) error {
+func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFunc {
+	return func(c tb.Context) error {
+		m := c.Message()
+		if m == nil || m.Sender == nil {
+			return nil
+		}
+		return h(c, d.db.GetUserIntensity(m.Sender.ID))
+	}
+}
+
+func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
 	if m.Animation.FileSize > MaxSizeMb {
@@ -44,8 +55,8 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context) error {
 	}
 
 	//TODO: Jesus, just find the time to refactor all of this already
-	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		progressMessage, filename, output, err := d.HandleAnimationCommon(c)
+		err := d.videoWorker.Submit(m.Chat.ID, func() {
+		progressMessage, filename, output, err := d.HandleAnimationCommon(c, intensity)
 		failed := err != nil
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
@@ -60,7 +71,7 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context) error {
 		// not sure why, but now I'm forced to specify filename manually
 		distorted := &tb.Animation{File: tb.FromDisk(output), FileName: output}
 		if m.Caption != "" {
-			distorted.Caption = distorters.DistortText(m.Caption)
+			distorted.Caption = distorters.DistortText(m.Caption, intensity)
 		}
 		err = d.SendMessageWithRepeater(c, distorted)
 		d.DoneMessageWithRepeater(b, progressMessage, failed)
@@ -75,7 +86,7 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context) error {
 	return nil
 }
 
-func (d DistorterBot) handlePhotoDistortion(c tb.Context) error {
+func (d DistorterBot) handlePhotoDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	filename, err := tools.JustGetTheFile(c.Bot(), m)
 	if err != nil {
@@ -83,19 +94,19 @@ func (d DistorterBot) handlePhotoDistortion(c tb.Context) error {
 		return err
 	}
 	defer os.Remove(filename)
-	err = distorters.DistortImage(filename)
+	err = distorters.DistortImage(filename, intensity)
 	if err != nil {
 		d.SendMessageWithRepeater(c, distorters.Failed)
 		return err
 	}
 	distorted := &tb.Photo{File: tb.FromDisk(filename)}
 	if m.Caption != "" {
-		distorted.Caption = distorters.DistortText(m.Caption)
+		distorted.Caption = distorters.DistortText(m.Caption, intensity)
 	}
 	return d.SendMessageWithRepeater(c, distorted)
 }
 
-func (d DistorterBot) handleRegularStickerDistortion(c tb.Context) error {
+func (d DistorterBot) handleRegularStickerDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	filename, err := tools.JustGetTheFile(c.Bot(), m)
 	if err != nil {
@@ -103,7 +114,7 @@ func (d DistorterBot) handleRegularStickerDistortion(c tb.Context) error {
 		return err
 	}
 	defer os.Remove(filename)
-	err = distorters.DistortImage(filename)
+	err = distorters.DistortImage(filename, intensity)
 	if err != nil {
 		d.SendMessageWithRepeater(c, distorters.Failed)
 		return err
@@ -116,7 +127,7 @@ func (d DistorterBot) handleVideoStickerDistortion(c tb.Context) error {
 	return c.Reply("You can go vote for this suggestion, for .webm stickers handling to become somewhat tolerable https://bugs.telegram.org/c/14858")
 }
 
-func (d DistorterBot) handleStickerDistortion(c tb.Context) error {
+func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	var err error
 	switch {
@@ -125,16 +136,16 @@ func (d DistorterBot) handleStickerDistortion(c tb.Context) error {
 	case m.Sticker.Video:
 		err = d.handleVideoStickerDistortion(c)
 	default:
-		err = d.handleRegularStickerDistortion(c)
+		err = d.handleRegularStickerDistortion(c, intensity)
 	}
 	return err
 }
 
-func (d DistorterBot) handleTextDistortion(c tb.Context) error {
-	return d.SendMessageWithRepeater(c, distorters.DistortText(c.Text()))
+func (d DistorterBot) handleTextDistortion(c tb.Context, intensity int) error {
+	return d.SendMessageWithRepeater(c, distorters.DistortText(c.Text(), intensity))
 }
 
-func (d DistorterBot) handleVideoDistortion(c tb.Context) error {
+func (d DistorterBot) handleVideoDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
 	if m.Video.FileSize > MaxSizeMb {
@@ -144,7 +155,7 @@ func (d DistorterBot) handleVideoDistortion(c tb.Context) error {
 	}
 
 	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c)
+		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
 		failed := err != nil
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
@@ -172,7 +183,7 @@ func (d DistorterBot) handleVideoDistortion(c tb.Context) error {
 	return nil
 }
 
-func (d DistorterBot) handleVideoNoteDistortion(c tb.Context) error {
+func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
 	if m.VideoNote.FileSize > MaxSizeMb {
@@ -182,7 +193,7 @@ func (d DistorterBot) handleVideoNoteDistortion(c tb.Context) error {
 	}
 
 	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c)
+		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
 		failed := err != nil
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
@@ -206,7 +217,7 @@ func (d DistorterBot) handleVideoNoteDistortion(c tb.Context) error {
 	return nil
 }
 
-func (d DistorterBot) handleVoiceDistortion(c tb.Context) error {
+func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	if m.Voice.FileSize > MaxSizeMb {
 		return c.Reply(distorters.TooBig)
@@ -218,7 +229,7 @@ func (d DistorterBot) handleVoiceDistortion(c tb.Context) error {
 	}
 	defer os.Remove(filename)
 	output := filename + ".ogg"
-	err = distorters.DistortSound(filename, output)
+	err = distorters.DistortSound(filename, output, intensity)
 	if err != nil {
 		d.SendMessageWithRepeater(c, distorters.Failed)
 		return err
@@ -242,23 +253,45 @@ func (d DistorterBot) handleReplyDistortion(c tb.Context) error {
 	update := c.Update()
 	update.Message = original
 	tweakedContext := c.Bot().NewContext(update)
+	intensity := d.db.GetUserIntensity(m.Sender.ID)
 	switch {
 	case original.Animation != nil:
-		return d.handleAnimationDistortion(tweakedContext)
+		return d.handleAnimationDistortion(tweakedContext, intensity)
 	case original.Sticker != nil:
-		return d.handleStickerDistortion(tweakedContext)
+		return d.handleStickerDistortion(tweakedContext, intensity)
 	case original.Photo != nil:
-		return d.handlePhotoDistortion(tweakedContext)
+		return d.handlePhotoDistortion(tweakedContext, intensity)
 	case original.Voice != nil:
-		return d.handleVoiceDistortion(tweakedContext)
+		return d.handleVoiceDistortion(tweakedContext, intensity)
 	case original.Video != nil:
-		return d.handleVideoDistortion(tweakedContext)
+		return d.handleVideoDistortion(tweakedContext, intensity)
 	case original.VideoNote != nil:
-		return d.handleVideoNoteDistortion(tweakedContext)
+		return d.handleVideoNoteDistortion(tweakedContext, intensity)
 	case original.Text != "":
-		return d.handleTextDistortion(tweakedContext)
+		return d.handleTextDistortion(tweakedContext, intensity)
 	}
 	return nil
+}
+
+func (d DistorterBot) handleIntensity(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
+	payload := strings.TrimSpace(m.Payload)
+	if payload == "" {
+		v := d.db.GetUserIntensity(m.Sender.ID)
+		return c.Reply(fmt.Sprintf("Your distortion intensity is %d (1 to 100, default %d). Send /intensity <n> to change it.", v, stats.DefaultIntensity))
+	}
+	n, err := strconv.Atoi(payload)
+	if err != nil || n < 1 || n > 100 {
+		return c.Reply("Send a number from 1 (subtle) to 100 (strong), e.g. /intensity 75")
+	}
+	if err := d.db.SetUserIntensity(m.Sender.ID, n); err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not save setting.")
+	}
+	return c.Reply(fmt.Sprintf("Intensity set to %d.", n))
 }
 
 func (d DistorterBot) handleStatRequest(c tb.Context, db *stats.DistortionerDB, period stats.Period) error {
@@ -361,6 +394,7 @@ func main() {
 		graceWg:     &sync.WaitGroup{},
 		videoWorker: tools.NewVideoWorker(3, priorityChats),
 		codec:       codec,
+		db:          db,
 	}
 	b.Poller = tb.NewMiddlewarePoller(&tb.LongPoller{Timeout: 10 * time.Second}, func(update *tb.Update) bool {
 		if update.Message == nil {
@@ -393,7 +427,7 @@ func main() {
 				}
 			}
 		}
-		if text != "/daily" && text != "/weekly" && text != "/monthly" && text != "/queue" {
+		if text != "/daily" && text != "/weekly" && text != "/monthly" && text != "/queue" && !strings.HasPrefix(text, "/intensity") {
 			go db.SaveStat(update.Message, isCommand)
 		}
 		return true
@@ -406,8 +440,10 @@ func main() {
 
 	b.Use(middleware.Recover())
 	b.Handle("/start", func(c tb.Context) error {
-		return c.Reply("Send me a picture, a sticker, a voice message, a video[note] or a GIF and I'll distort it")
+		return c.Reply("Send me a picture, a sticker, a voice message, a video[note] or a GIF and I'll distort it. Use /intensity (1 to 100) to tune how strong the effect is.")
 	})
+
+	b.Handle("/intensity", d.handleIntensity)
 
 	b.Handle("/daily", d.ApplyShutdownMiddleware(func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Daily)
@@ -426,13 +462,13 @@ func main() {
 	b.Handle("/maintenance", d.handleMaintenance)
 
 	b.Handle("/distort", d.ApplyShutdownMiddleware(d.handleReplyDistortion))
-	b.Handle(tb.OnAnimation, d.ApplyShutdownMiddleware(d.handleAnimationDistortion))
-	b.Handle(tb.OnSticker, d.ApplyShutdownMiddleware(d.handleStickerDistortion))
-	b.Handle(tb.OnPhoto, d.ApplyShutdownMiddleware(d.handlePhotoDistortion))
-	b.Handle(tb.OnVoice, d.ApplyShutdownMiddleware(d.handleVoiceDistortion))
-	b.Handle(tb.OnVideo, d.ApplyShutdownMiddleware(d.handleVideoDistortion))
-	b.Handle(tb.OnVideoNote, d.ApplyShutdownMiddleware(d.handleVideoNoteDistortion))
-	b.Handle(tb.OnText, d.ApplyShutdownMiddleware(d.handleTextDistortion))
+	b.Handle(tb.OnAnimation, d.ApplyShutdownMiddleware(d.withIntensity(d.handleAnimationDistortion)))
+	b.Handle(tb.OnSticker, d.ApplyShutdownMiddleware(d.withIntensity(d.handleStickerDistortion)))
+	b.Handle(tb.OnPhoto, d.ApplyShutdownMiddleware(d.withIntensity(d.handlePhotoDistortion)))
+	b.Handle(tb.OnVoice, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVoiceDistortion)))
+	b.Handle(tb.OnVideo, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVideoDistortion)))
+	b.Handle(tb.OnVideoNote, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVideoNoteDistortion)))
+	b.Handle(tb.OnText, d.ApplyShutdownMiddleware(d.withIntensity(d.handleTextDistortion)))
 
 	go func() {
 		signChan := make(chan os.Signal, 1)

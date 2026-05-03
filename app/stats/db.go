@@ -10,6 +10,8 @@ import (
 	tb "gopkg.in/telebot.v3"
 )
 
+const DefaultIntensity = 50
+
 type DistortionerDB struct {
 	db     *sql.DB
 	insert *sql.Stmt
@@ -81,7 +83,40 @@ func InitDB(logger *zap.SugaredLogger) *DistortionerDB {
 		logger.Fatal(err)
 	}
 	dist.insert = insertStat
+
+	_, err = db.Exec(`create table if not exists user_settings(user_id integer not null primary key, intensity integer not null default 50)`)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
 	return &dist
+}
+
+func (d *DistortionerDB) GetUserIntensity(userID int64) int {
+	var intensity sql.NullInt64
+	err := d.db.QueryRow(`select intensity from user_settings where user_id = ?`, userID).Scan(&intensity)
+	if err != nil || !intensity.Valid {
+		return DefaultIntensity
+	}
+	v := int(intensity.Int64)
+	if v < 1 || v > 100 {
+		return DefaultIntensity
+	}
+	return v
+}
+
+func (d *DistortionerDB) SetUserIntensity(userID int64, intensity int) error {
+	if intensity < 1 {
+		intensity = 1
+	}
+	if intensity > 100 {
+		intensity = 100
+	}
+	_, err := d.db.Exec(`
+		insert into user_settings(user_id, intensity) values(?, ?)
+		on conflict(user_id) do update set intensity = excluded.intensity`,
+		userID, intensity)
+	return err
 }
 
 func (d *DistortionerDB) SaveStat(message *tb.Message, isCommand bool) {

@@ -24,7 +24,7 @@ const (
 	Send
 )
 
-func (d DistorterBot) HandleAnimationCommon(c tb.Context) (*tb.Message, string, string, error) {
+func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Message, string, string, error) {
 	m := c.Message()
 	b := c.Bot()
 	progressMessage, err := d.SendMessage(c, "Downloading...", Reply)
@@ -39,7 +39,7 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context) (*tb.Message, string, 
 	}
 	animationOutput := filename + ".mp4"
 	progressChan := make(chan string, 3)
-	go distorters.DistortVideo(filename, d.codec, animationOutput, progressChan)
+	go distorters.DistortVideo(filename, d.codec, animationOutput, intensity, progressChan)
 	for report := range progressChan {
 		if progressMessage == nil {
 			continue
@@ -53,8 +53,8 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context) (*tb.Message, string, 
 	return progressMessage, filename, animationOutput, err
 }
 
-func (d DistorterBot) HandleVideoCommon(c tb.Context) (string, *tb.Message, error) {
-	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c)
+func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity int) (string, *tb.Message, error) {
+	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c, intensity)
 	defer os.Remove(filename)
 	if err != nil {
 		if progressMessage != nil && progressMessage.Text != distorters.TooLong {
@@ -64,7 +64,7 @@ func (d DistorterBot) HandleVideoCommon(c tb.Context) (string, *tb.Message, erro
 	}
 	defer os.Remove(animationOutput)
 	soundOutput := filename + ".ogg"
-	err = distorters.DistortSound(filename, soundOutput)
+	err = distorters.DistortSound(filename, soundOutput, intensity)
 	if err != nil {
 		soundOutput = ""
 	} else {
@@ -79,7 +79,7 @@ func (d DistorterBot) HandleVideoCommon(c tb.Context) (string, *tb.Message, erro
 	return output, progressMessage, err
 }
 
-func (d DistorterBot) HandleVideoSticker(c tb.Context) (string, string, error) {
+func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity int) (string, string, error) {
 	filename, err := tools.JustGetTheFile(c.Bot(), c.Message())
 	if err != nil {
 		d.logger.Error(err)
@@ -88,7 +88,7 @@ func (d DistorterBot) HandleVideoSticker(c tb.Context) (string, string, error) {
 	animationOutput := filename + ".webm"
 	group := sync.WaitGroup{}
 	group.Add(1)
-	go distorters.DistortVideoSticker(filename, animationOutput, &group)
+	go distorters.DistortVideoSticker(filename, animationOutput, intensity, &group)
 	group.Wait()
 	_, err = os.Stat(animationOutput)
 	return filename, animationOutput, err

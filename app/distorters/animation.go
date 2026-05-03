@@ -23,7 +23,7 @@ const (
 	Queued  = "Your message has been queued"
 )
 
-func DistortVideo(filename, codec, output string, progressChan chan string) {
+func DistortVideo(filename, codec, output string, intensity int, progressChan chan string) {
 	progressChan <- "Extracting frames..."
 	defer close(progressChan)
 	framesDir := filename + "Frames"
@@ -51,7 +51,7 @@ func DistortVideo(filename, codec, output string, progressChan chan string) {
 
 	distortedFrames := 0
 	doneChan := make(chan int, 8)
-	go poolDistortImages(framesDir, doneChan)
+	go poolDistortImages(framesDir, doneChan, intensity)
 
 	lastUpdate := time.Now()
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
@@ -137,7 +137,7 @@ func collectFramesToVideoSticker(numberedFileName, frameRateFraction, filename s
 		filename)
 }
 
-func poolDistortImages(frameDir string, doneChan chan int) {
+func poolDistortImages(frameDir string, doneChan chan int, intensity int) {
 	cpuCount := runtime.NumCPU()
 	sem := make(chan bool, cpuCount)
 	frames, err := os.ReadDir(frameDir)
@@ -154,7 +154,7 @@ func poolDistortImages(frameDir string, doneChan chan int) {
 				<-sem
 				doneChan <- 1
 			}()
-			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame))
+			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame), intensity)
 			if err != nil {
 				doneChan <- -1
 			}

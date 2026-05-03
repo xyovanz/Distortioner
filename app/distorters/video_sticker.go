@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func DistortVideoSticker(filename, output string, group *sync.WaitGroup) {
+func DistortVideoSticker(filename, output string, intensity int, group *sync.WaitGroup) {
 	defer group.Done()
 	framesDir := filename + "Frames"
 	err := os.Mkdir(framesDir, 0755)
@@ -33,7 +33,7 @@ func DistortVideoSticker(filename, output string, group *sync.WaitGroup) {
 
 	distortedFrames := 0
 	doneChan := make(chan int, 8)
-	go poolDistortImages(framesDir, doneChan)
+	go poolDistortImages(framesDir, doneChan, intensity)
 
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
