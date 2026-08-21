@@ -117,8 +117,10 @@ func extractFramesFromVideoSticker(frameRateFraction, filename, numberedFileName
 }
 
 func collectFramesToVideo(numberedFileName, frameRateFraction, codec, filename string) error {
+	// libx264 + yuv420p requires even width/height; liquid-rescale can leave odd sizes (e.g. 383x383).
 	return runFfmpeg("-r", frameRateFraction,
 		"-i", numberedFileName,
+		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
 		"-f", "mp4",
 		"-c:v", codec,
 		"-an",
@@ -129,6 +131,7 @@ func collectFramesToVideo(numberedFileName, frameRateFraction, codec, filename s
 func collectFramesToVideoSticker(numberedFileName, frameRateFraction, filename string) error {
 	return runFfmpeg("-r", frameRateFraction,
 		"-i", numberedFileName,
+		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
 		"-f", "webm",
 		"-c:v", "libvpx-vp9",
 		"-b:v", "85k", // ebuchiy shakal mode activated
