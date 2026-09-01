@@ -26,7 +26,7 @@ jobs:
           context: .
           pull: true
           push: true
-          tags: ghcr.io/graynk/distortioner:latest
+          tags: ghcr.io/xyovanz/distortioner:latest
   releases-matrix:
     name: Release Go Binary
     runs-on: ubuntu-latest

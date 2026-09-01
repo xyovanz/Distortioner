@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -35,7 +36,7 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Me
 	filename, err := tools.JustGetTheFile(b, m)
 	if err != nil {
 		d.logger.Error(err)
-		return nil, "", "", err
+		return progressMessage, "", "", errors.New(distorters.FailedDownload)
 	}
 	animationOutput := filename + ".mp4"
 	progressChan := make(chan string, 3)
@@ -50,25 +51,30 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Me
 		}
 	}
 	_, err = os.Stat(animationOutput)
-	return progressMessage, filename, animationOutput, err
+	if err != nil {
+		if progressMessage != nil && distorters.IsFailureStatus(progressMessage.Text) {
+			return progressMessage, filename, animationOutput, errors.New(progressMessage.Text)
+		}
+		return progressMessage, filename, animationOutput, errors.New(distorters.FailedEncode)
+	}
+	return progressMessage, filename, animationOutput, nil
 }
 
 func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity int) (string, *tb.Message, error) {
 	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c, intensity)
-	defer os.Remove(filename)
-	if err != nil {
-		if progressMessage != nil && progressMessage.Text != distorters.TooLong {
-			d.DoneMessageWithRepeater(c.Bot(), progressMessage, true)
-		}
+	failed := err != nil
+	defer tools.RemoveTemp(filename, failed)
+	if failed {
+		// Callers update the progress message; avoid double DoneMessage here.
 		return "", progressMessage, err
 	}
-	defer os.Remove(animationOutput)
+	defer tools.RemoveTemp(animationOutput, false)
 	soundOutput := filename + ".ogg"
 	err = distorters.DistortSound(filename, soundOutput, intensity)
 	if err != nil {
 		soundOutput = ""
 	} else {
-		defer os.Remove(soundOutput)
+		defer tools.RemoveTemp(soundOutput, false)
 	}
 	output := filename + "Final.mp4"
 	if progressMessage != nil {
@@ -76,7 +82,11 @@ func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity int) (string, *t
 		c.Edit(progressMessage, "Muxing frames with sound back together...")
 	}
 	err = distorters.CollectAnimationAndSound(animationOutput, soundOutput, output)
-	return output, progressMessage, err
+	if err != nil {
+		tools.RemoveTemp(output, true)
+		return "", progressMessage, errors.New(distorters.FailedEncode)
+	}
+	return output, progressMessage, nil
 }
 
 func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity int) (string, string, error) {
@@ -94,21 +104,22 @@ func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity int) (string, s
 	return filename, animationOutput, err
 }
 
-func (d DistorterBot) dealWithStatusMessage(b *tb.Bot, m *tb.Message, failed bool) error {
+func (d DistorterBot) dealWithStatusMessage(b *tb.Bot, m *tb.Message, failMsg string) error {
 	if m == nil {
 		return nil
 	}
 	var err error
-	if failed {
-		_, err = b.Edit(m, distorters.Failed)
+	if failMsg != "" {
+		_, err = b.Edit(m, failMsg)
 	} else {
 		err = b.Delete(m)
 	}
 	return err
 }
 
-func (d DistorterBot) DoneMessageWithRepeater(b *tb.Bot, m *tb.Message, failed bool) {
-	err := d.dealWithStatusMessage(b, m, failed)
+// DoneMessageWithRepeater deletes the progress message on success, or edits it to failMsg on failure.
+func (d DistorterBot) DoneMessageWithRepeater(b *tb.Bot, m *tb.Message, failMsg string) {
+	err := d.dealWithStatusMessage(b, m, failMsg)
 	for err != nil {
 		var timeout int
 		timeout, err = tools.ExtractPossibleTimeout(err)
@@ -116,7 +127,7 @@ func (d DistorterBot) DoneMessageWithRepeater(b *tb.Bot, m *tb.Message, failed b
 			return
 		}
 		time.Sleep(time.Duration(timeout) * time.Second)
-		err = d.dealWithStatusMessage(b, m, failed)
+		err = d.dealWithStatusMessage(b, m, failMsg)
 	}
 }
 

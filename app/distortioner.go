@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +26,8 @@ import (
 const (
 	MaxSizeMb = 20_000_000
 )
+
+var safeBranchRe = regexp.MustCompile(`^[a-zA-Z0-9._/\-]+$`)
 
 type DistorterBot struct {
 	adminID     int64
@@ -45,6 +50,13 @@ func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFun
 	}
 }
 
+func failStatus(err error, progress *tb.Message) string {
+	if progress != nil && distorters.IsFailureStatus(progress.Text) {
+		return progress.Text
+	}
+	return distorters.UserFacingError(err)
+}
+
 func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
@@ -55,18 +67,18 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) err
 	}
 
 	//TODO: Jesus, just find the time to refactor all of this already
-		err := d.videoWorker.Submit(m.Chat.ID, func() {
+	err := d.videoWorker.Submit(m.Chat.ID, func() {
 		progressMessage, filename, output, err := d.HandleAnimationCommon(c, intensity)
 		failed := err != nil
+		defer tools.RemoveTemp(filename, failed)
+		defer tools.RemoveTemp(output, failed)
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
-				d.DoneMessageWithRepeater(b, progressMessage, failed)
+				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
 			}
 			d.logger.Error(err)
 			return
 		}
-		defer os.Remove(filename)
-		defer os.Remove(output)
 
 		// not sure why, but now I'm forced to specify filename manually
 		distorted := &tb.Animation{File: tb.FromDisk(output), FileName: output}
@@ -74,7 +86,10 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) err
 			distorted.Caption = distorters.DistortText(m.Caption, intensity)
 		}
 		err = d.SendMessageWithRepeater(c, distorted)
-		d.DoneMessageWithRepeater(b, progressMessage, failed)
+		d.DoneMessageWithRepeater(b, progressMessage, "")
+		if err != nil {
+			d.logger.Error(err)
+		}
 	})
 	if err != nil {
 		d.SendMessageWithRepeater(c, err.Error())
@@ -93,10 +108,11 @@ func (d DistorterBot) handlePhotoDistortion(c tb.Context, intensity int) error {
 		d.logger.Error(err)
 		return err
 	}
-	defer os.Remove(filename)
 	err = distorters.DistortImage(filename, intensity)
-	if err != nil {
-		d.SendMessageWithRepeater(c, distorters.Failed)
+	failed := err != nil
+	defer tools.RemoveTemp(filename, failed)
+	if failed {
+		d.SendMessageWithRepeater(c, distorters.FailedDistortImage)
 		return err
 	}
 	distorted := &tb.Photo{File: tb.FromDisk(filename)}
@@ -113,10 +129,11 @@ func (d DistorterBot) handleRegularStickerDistortion(c tb.Context, intensity int
 		d.logger.Error(err)
 		return err
 	}
-	defer os.Remove(filename)
 	err = distorters.DistortImage(filename, intensity)
-	if err != nil {
-		d.SendMessageWithRepeater(c, distorters.Failed)
+	failed := err != nil
+	defer tools.RemoveTemp(filename, failed)
+	if failed {
+		d.SendMessageWithRepeater(c, distorters.FailedDistortImage)
 		return err
 	}
 	distorted := &tb.Sticker{File: tb.FromDisk(filename)}
@@ -142,6 +159,10 @@ func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error
 }
 
 func (d DistorterBot) handleTextDistortion(c tb.Context, intensity int) error {
+	m := c.Message()
+	if tools.IsBotCommand(m) {
+		return nil
+	}
 	return d.SendMessageWithRepeater(c, distorters.DistortText(c.Text(), intensity))
 }
 
@@ -157,18 +178,18 @@ func (d DistorterBot) handleVideoDistortion(c tb.Context, intensity int) error {
 	err := d.videoWorker.Submit(m.Chat.ID, func() {
 		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
 		failed := err != nil
+		defer tools.RemoveTemp(output, failed)
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
-				d.DoneMessageWithRepeater(b, progressMessage, failed)
+				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
 			}
 			d.logger.Error(err)
 			return
 		}
-		defer os.Remove(output)
 
 		distorted := &tb.Video{File: tb.FromDisk(output)}
 		err = d.SendMessageWithRepeater(c, distorted)
-		d.DoneMessageWithRepeater(b, progressMessage, failed)
+		d.DoneMessageWithRepeater(b, progressMessage, "")
 		if err != nil {
 			d.logger.Error(err)
 		}
@@ -195,17 +216,20 @@ func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, intensity int) err
 	err := d.videoWorker.Submit(m.Chat.ID, func() {
 		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
 		failed := err != nil
+		defer tools.RemoveTemp(output, failed)
 		if failed {
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
 				d.logger.Error(err)
-				d.DoneMessageWithRepeater(b, progressMessage, failed)
+				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
 			}
 			return
 		}
-		defer os.Remove(output)
 		distorted := &tb.VideoNote{File: tb.FromDisk(output)}
 		err = d.SendMessageWithRepeater(c, distorted)
-		d.DoneMessageWithRepeater(b, progressMessage, failed)
+		d.DoneMessageWithRepeater(b, progressMessage, "")
+		if err != nil {
+			d.logger.Error(err)
+		}
 	})
 	if err != nil {
 		d.SendMessageWithRepeater(c, err.Error())
@@ -227,14 +251,15 @@ func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
 		d.logger.Error(err)
 		return err
 	}
-	defer os.Remove(filename)
 	output := filename + ".ogg"
 	err = distorters.DistortSound(filename, output, intensity)
-	if err != nil {
-		d.SendMessageWithRepeater(c, distorters.Failed)
+	failed := err != nil
+	defer tools.RemoveTemp(filename, failed)
+	defer tools.RemoveTemp(output, failed)
+	if failed {
+		d.SendMessageWithRepeater(c, distorters.FailedDistortAudio)
 		return err
 	}
-	defer os.Remove(output)
 
 	distorted := &tb.Voice{File: tb.FromDisk(output)}
 	return d.SendMessageWithRepeater(c, distorted)
@@ -294,6 +319,74 @@ func (d DistorterBot) handleIntensity(c tb.Context) error {
 	return c.Reply(fmt.Sprintf("Intensity set to %d.", n))
 }
 
+func (d DistorterBot) handleUpdate(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
+		return nil
+	}
+	branch := strings.TrimSpace(m.Payload)
+	if branch == "" {
+		branch = os.Getenv("DISTORTIONER_UPDATE_BRANCH")
+	}
+	if branch == "" {
+		branch = "wip"
+	}
+	if !safeBranchRe.MatchString(branch) {
+		return c.Reply("Invalid branch name.")
+	}
+
+	script := os.Getenv("DISTORTIONER_UPDATE_SCRIPT")
+	if script == "" {
+		script = "update.sh"
+	}
+	if _, err := os.Stat(script); err != nil {
+		return c.Reply("update.sh not found. Mount the git checkout (or set DISTORTIONER_UPDATE_SCRIPT).")
+	}
+
+	logPath := os.Getenv("DISTORTIONER_UPDATE_LOG")
+	if logPath == "" {
+		logPath = filepath.Join("data", "update.log")
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not create update log directory.")
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not open update log.")
+	}
+
+	cmd := exec.Command("bash", script, branch)
+	cmd.Dir = filepath.Dir(script)
+	if cmd.Dir == "." || cmd.Dir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cmd.Dir = wd
+		}
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Env = append(os.Environ(),
+		"UPDATE_NOTIFY_CHAT_ID="+strconv.FormatInt(m.Chat.ID, 10),
+		"UPDATE_BRANCH="+branch,
+	)
+	if token := os.Getenv("DISTORTIONER_BOT_TOKEN"); token != "" {
+		cmd.Env = append(cmd.Env, "DISTORTIONER_BOT_TOKEN="+token)
+	}
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		d.logger.Error(err)
+		return c.Reply("Failed to start update: " + err.Error())
+	}
+	go func() {
+		_ = cmd.Wait()
+		_ = logFile.Close()
+	}()
+
+	return c.Reply(fmt.Sprintf("Checking origin/%s for updates…\nWill rebuild and recreate the container if needed.\nLog: %s", branch, logPath))
+}
+
 func (d DistorterBot) handleStatRequest(c tb.Context, db *stats.DistortionerDB, period stats.Period) error {
 	m := c.Message()
 	if m.Sender.ID != d.adminID {
@@ -346,6 +439,20 @@ func (d DistorterBot) handleMaintenance(c tb.Context) error {
 	}
 	currentMode := d.videoWorker.ToggleMaintenance()
 	return c.Reply(fmt.Sprintf("Maintenance on: %v", currentMode))
+}
+
+func skipStatCommand(text string) bool {
+	switch {
+	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update":
+		return true
+	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/update@"):
+		return true
+	case strings.HasPrefix(text, "/daily@"), strings.HasPrefix(text, "/weekly@"), strings.HasPrefix(text, "/monthly@"),
+		strings.HasPrefix(text, "/queue@"), strings.HasPrefix(text, "/maintenance@"):
+		return true
+	default:
+		return false
+	}
 }
 
 func main() {
@@ -403,7 +510,7 @@ func main() {
 		m := update.Message
 		isCommand := len(m.Entities) > 0 && m.Entities[0].Type == tb.EntityCommand
 		text := update.Message.Text
-		if m.FromGroup() && !(isCommand && strings.HasSuffix(text, b.Me.Username)) {
+		if m.FromGroup() && !tools.IsCommandForBot(m, b.Me.Username) {
 			return false
 		}
 		// throw away old messages
@@ -427,7 +534,7 @@ func main() {
 				}
 			}
 		}
-		if text != "/daily" && text != "/weekly" && text != "/monthly" && text != "/queue" && !strings.HasPrefix(text, "/intensity") {
+		if !skipStatCommand(text) {
 			go db.SaveStat(update.Message, isCommand)
 		}
 		return true
@@ -444,6 +551,7 @@ func main() {
 	})
 
 	b.Handle("/intensity", d.handleIntensity)
+	b.Handle("/update", d.handleUpdate)
 
 	b.Handle("/daily", d.ApplyShutdownMiddleware(func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Daily)
