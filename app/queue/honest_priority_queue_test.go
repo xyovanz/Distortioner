@@ -42,3 +42,34 @@ func TestHonestJobQueue_RepeatUsers(t *testing.T) {
 
 	assert.Equal(t, []int64{1, 3, 2, 1, 2, 1}, poppedIDs)
 }
+
+// BanUser must drop only that user's jobs. A previous loop left the ban flag
+// sticky and drained every remaining job once any banned job reached the front.
+func TestHonestJobQueue_BanSkipsOnlyBannedUser(t *testing.T) {
+	hjq := NewHonestJobQueue(50, []int64{})
+
+	assert.NoError(t, hjq.Push(1, func() {}))
+	assert.NoError(t, hjq.Push(1, func() {}))
+	assert.NoError(t, hjq.Push(2, func() {}))
+	assert.NoError(t, hjq.Push(3, func() {}))
+
+	hjq.BanUser(1)
+
+	first := hjq.Pop()
+	if assert.NotNil(t, first) {
+		assert.Equal(t, int64(2), first.userID)
+	}
+	second := hjq.Pop()
+	if assert.NotNil(t, second) {
+		assert.Equal(t, int64(3), second.userID)
+	}
+	assert.Nil(t, hjq.Pop())
+	assert.Equal(t, 0, hjq.Len())
+
+	// Ban lifts after banned user's jobs are exhausted; they can enqueue again.
+	assert.NoError(t, hjq.Push(1, func() {}))
+	revived := hjq.Pop()
+	if assert.NotNil(t, revived) {
+		assert.Equal(t, int64(1), revived.userID)
+	}
+}
