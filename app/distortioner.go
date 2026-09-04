@@ -38,6 +38,7 @@ type DistorterBot struct {
 	videoWorker *tools.VideoWorker
 	codec       string
 	db          *stats.DistortionerDB
+	startedAt   time.Time
 }
 
 func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFunc {
@@ -50,6 +51,14 @@ func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFun
 	}
 }
 
+func (d DistorterBot) userRamp(userID int64) (from, to int) {
+	from, to, ok := d.db.GetUserRamp(userID)
+	if !ok {
+		return 0, 0
+	}
+	return from, to
+}
+
 func failStatus(err error, progress *tb.Message) string {
 	if progress != nil && distorters.IsFailureStatus(progress.Text) {
 		return progress.Text
@@ -57,18 +66,32 @@ func failStatus(err error, progress *tb.Message) string {
 	return distorters.UserFacingError(err)
 }
 
+// submitVideoJob gates size/rate-limit, enqueues work, and tells the user their queue position when busy.
+func (d DistorterBot) submitVideoJob(c tb.Context, fileSize int64, work func()) error {
+	m := c.Message()
+	if fileSize > MaxSizeMb {
+		return d.SendMessageWithRepeater(c, distorters.TooBig)
+	}
+	if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
+		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
+	}
+	pos, err := d.videoWorker.Submit(m.Chat.ID, work)
+	if err != nil {
+		d.SendMessageWithRepeater(c, err.Error())
+		return nil
+	}
+	if d.videoWorker.IsBusy() {
+		d.SendMessageWithRepeater(c, distorters.FormatQueued(pos))
+	}
+	return nil
+}
+
 func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
-	if m.Animation.FileSize > MaxSizeMb {
-		return d.SendMessageWithRepeater(c, distorters.TooBig)
-	} else if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
-		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
-	}
-
-	//TODO: Jesus, just find the time to refactor all of this already
-	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		progressMessage, filename, output, err := d.HandleAnimationCommon(c, intensity)
+	rampFrom, rampTo := d.userRamp(m.Sender.ID)
+	return d.submitVideoJob(c, m.Animation.FileSize, func() {
+		progressMessage, filename, output, err := d.HandleAnimationCommon(c, intensity, rampFrom, rampTo)
 		failed := err != nil
 		defer tools.RemoveTemp(filename, failed)
 		defer tools.RemoveTemp(output, failed)
@@ -80,7 +103,6 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) err
 			return
 		}
 
-		// not sure why, but now I'm forced to specify filename manually
 		distorted := &tb.Animation{File: tb.FromDisk(output), FileName: output}
 		if m.Caption != "" {
 			distorted.Caption = distorters.DistortText(m.Caption, intensity)
@@ -91,14 +113,6 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) err
 			d.logger.Error(err)
 		}
 	})
-	if err != nil {
-		d.SendMessageWithRepeater(c, err.Error())
-		return nil
-	}
-	if d.videoWorker.IsBusy() {
-		d.SendMessageWithRepeater(c, distorters.Queued)
-	}
-	return nil
 }
 
 func (d DistorterBot) handlePhotoDistortion(c tb.Context, intensity int) error {
@@ -142,14 +156,9 @@ func (d DistorterBot) handleRegularStickerDistortion(c tb.Context, intensity int
 
 func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
-	if m.Sticker.FileSize > MaxSizeMb {
-		return d.SendMessageWithRepeater(c, distorters.TooBig)
-	} else if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
-		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
-	}
-
-	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		filename, output, err := d.HandleVideoSticker(c, intensity)
+	rampFrom, rampTo := d.userRamp(m.Sender.ID)
+	return d.submitVideoJob(c, m.Sticker.FileSize, func() {
+		filename, output, err := d.HandleVideoSticker(c, intensity, rampFrom, rampTo)
 		failed := err != nil
 		defer tools.RemoveTemp(filename, failed)
 		defer tools.RemoveTemp(output, failed)
@@ -163,14 +172,6 @@ func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, intensity int) 
 			d.logger.Error(sendErr)
 		}
 	})
-	if err != nil {
-		d.SendMessageWithRepeater(c, err.Error())
-		return nil
-	}
-	if d.videoWorker.IsBusy() {
-		d.SendMessageWithRepeater(c, distorters.Queued)
-	}
-	return nil
 }
 
 func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error {
@@ -198,14 +199,9 @@ func (d DistorterBot) handleTextDistortion(c tb.Context, intensity int) error {
 func (d DistorterBot) handleVideoDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
-	if m.Video.FileSize > MaxSizeMb {
-		return d.SendMessageWithRepeater(c, distorters.TooBig)
-	} else if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
-		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
-	}
-
-	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
+	rampFrom, rampTo := d.userRamp(m.Sender.ID)
+	return d.submitVideoJob(c, m.Video.FileSize, func() {
+		output, progressMessage, err := d.HandleVideoCommon(c, intensity, rampFrom, rampTo)
 		failed := err != nil
 		defer tools.RemoveTemp(output, failed)
 		if failed {
@@ -223,27 +219,14 @@ func (d DistorterBot) handleVideoDistortion(c tb.Context, intensity int) error {
 			d.logger.Error(err)
 		}
 	})
-	if err != nil {
-		d.SendMessageWithRepeater(c, err.Error())
-		return nil
-	}
-	if d.videoWorker.IsBusy() {
-		d.SendMessageWithRepeater(c, distorters.Queued)
-	}
-	return nil
 }
 
 func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, intensity int) error {
 	m := c.Message()
 	b := c.Bot()
-	if m.VideoNote.FileSize > MaxSizeMb {
-		return d.SendMessageWithRepeater(c, distorters.TooBig)
-	} else if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
-		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
-	}
-
-	err := d.videoWorker.Submit(m.Chat.ID, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c, intensity)
+	rampFrom, rampTo := d.userRamp(m.Sender.ID)
+	return d.submitVideoJob(c, m.VideoNote.FileSize, func() {
+		output, progressMessage, err := d.HandleVideoCommon(c, intensity, rampFrom, rampTo)
 		failed := err != nil
 		defer tools.RemoveTemp(output, failed)
 		if failed {
@@ -260,14 +243,6 @@ func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, intensity int) err
 			d.logger.Error(err)
 		}
 	})
-	if err != nil {
-		d.SendMessageWithRepeater(c, err.Error())
-		return nil
-	}
-	if d.videoWorker.IsBusy() {
-		d.SendMessageWithRepeater(c, distorters.Queued)
-	}
-	return nil
 }
 
 func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
@@ -349,6 +324,267 @@ func (d DistorterBot) handleIntensity(c tb.Context) error {
 		return c.Reply("Could not save setting.")
 	}
 	return c.Reply(fmt.Sprintf("Intensity set to %d.", n))
+}
+
+func (d DistorterBot) handleRamp(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
+	payload := strings.TrimSpace(m.Payload)
+	if payload == "" {
+		from, to, enabled, err := d.db.ToggleUserRamp(m.Sender.ID)
+		if err != nil {
+			d.logger.Error(err)
+			return c.Reply("Could not save setting.")
+		}
+		if enabled {
+			return c.Reply(fmt.Sprintf("Progressive ramp on: %d → %d across frames. Send /ramp again to turn off, or /ramp <from> <to> to change.", from, to))
+		}
+		return c.Reply("Progressive ramp off (flat /intensity for every frame). Send /ramp again to turn on.")
+	}
+	if strings.EqualFold(payload, "off") || strings.EqualFold(payload, "disable") || payload == "0" {
+		if err := d.db.ClearUserRamp(m.Sender.ID); err != nil {
+			d.logger.Error(err)
+			return c.Reply("Could not save setting.")
+		}
+		return c.Reply("Progressive ramp off.")
+	}
+	if strings.EqualFold(payload, "on") || strings.EqualFold(payload, "enable") {
+		from, to, _, has := d.db.GetUserRampConfig(m.Sender.ID)
+		if !has {
+			from, to = stats.DefaultRampEndpoints(d.db.GetUserIntensity(m.Sender.ID))
+		}
+		if err := d.db.SetUserRamp(m.Sender.ID, from, to); err != nil {
+			d.logger.Error(err)
+			return c.Reply("Could not save setting.")
+		}
+		return c.Reply(fmt.Sprintf("Progressive ramp on: %d → %d.", from, to))
+	}
+	parts := strings.Fields(payload)
+	if len(parts) != 2 {
+		return c.Reply("Usage: /ramp — toggle; /ramp <from> <to> — set endpoints; /ramp off")
+	}
+	from, err1 := strconv.Atoi(parts[0])
+	to, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || from < 1 || from > 100 || to < 1 || to > 100 {
+		return c.Reply("Both values must be integers from 1 to 100, e.g. /ramp 20 80")
+	}
+	if err := d.db.SetUserRamp(m.Sender.ID, from, to); err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not save setting.")
+	}
+	return c.Reply(fmt.Sprintf("Progressive ramp on: %d → %d.", from, to))
+}
+
+func (d DistorterBot) handleStart(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
+	welcome := "Send me a picture, a sticker, a voice message, a video[note] or a GIF and I'll distort it.\n" +
+		"Use /intensity (1–100) for strength, /ramp to toggle progressive frames (or /ramp <from> <to>)."
+	if m.Sender.ID == d.adminID {
+		return c.Reply(welcome + "\n\n(admin online)")
+	}
+	if err := c.Reply(welcome); err != nil {
+		d.logger.Error(err)
+	}
+	username := "N/A"
+	if m.Sender.Username != "" {
+		username = "@" + m.Sender.Username
+	}
+	fullName := m.Sender.FirstName
+	if m.Sender.LastName != "" {
+		fullName += " " + m.Sender.LastName
+	}
+	if fullName == "" {
+		fullName = "Unknown"
+	}
+	adminText := fmt.Sprintf("АЛЯРМ! До бота доебался\n\nID: %d\nИмя: %s\nUsername: %s", m.Sender.ID, fullName, username)
+	markup := &tb.ReplyMarkup{}
+	btn := markup.Data("🚫 Ban User", "ban", strconv.FormatInt(m.Sender.ID, 10))
+	markup.Inline(markup.Row(btn))
+	if _, err := c.Bot().Send(&tb.User{ID: d.adminID}, adminText, markup); err != nil {
+		d.logger.Errorw("admin start alert failed", "err", err)
+	}
+	if _, err := c.Bot().Forward(&tb.User{ID: d.adminID}, m); err != nil {
+		d.logger.Errorw("forward /start failed", "err", err)
+	}
+	return nil
+}
+
+func (d DistorterBot) handleBanCommand(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
+		return nil
+	}
+	payload := strings.TrimSpace(m.Payload)
+	id, err := strconv.ParseInt(payload, 10, 64)
+	if err != nil || id == 0 {
+		return c.Reply("Usage: /ban <user_id>")
+	}
+	if id == d.adminID {
+		return c.Reply("Can't ban yourself.")
+	}
+	ok, err := d.db.BanUser(id)
+	if err != nil {
+		d.logger.Error(err)
+		return c.Reply("Failed to ban.")
+	}
+	if !ok {
+		return c.Reply(fmt.Sprintf("User %d is already banned.", id))
+	}
+	d.videoWorker.BanUser(id)
+	return c.Reply(fmt.Sprintf("User %d has been banned.", id))
+}
+
+func (d DistorterBot) handleUnbanCommand(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
+		return nil
+	}
+	payload := strings.TrimSpace(m.Payload)
+	id, err := strconv.ParseInt(payload, 10, 64)
+	if err != nil || id == 0 {
+		return c.Reply("Usage: /unban <user_id>")
+	}
+	ok, err := d.db.UnbanUser(id)
+	if err != nil {
+		d.logger.Error(err)
+		return c.Reply("Failed to unban.")
+	}
+	if !ok {
+		return c.Reply(fmt.Sprintf("User %d was not banned.", id))
+	}
+	return c.Reply(fmt.Sprintf("User %d has been unbanned.", id))
+}
+
+func (d DistorterBot) handleBannedUsers(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
+		return nil
+	}
+	ids, err := d.db.BannedUsers()
+	if err != nil {
+		d.logger.Error(err)
+		return c.Reply("Failed to list bans.")
+	}
+	if len(ids) == 0 {
+		return c.Reply("No banned users.")
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Banned users (%d):\n", len(ids)))
+	for _, id := range ids {
+		b.WriteString(fmt.Sprintf("%d\n", id))
+	}
+	return c.Reply(b.String())
+}
+
+func (d DistorterBot) handleUnbanRequest(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
+	if !d.db.IsBanned(m.Sender.ID) {
+		return c.Reply("You are not banned.")
+	}
+	reason := strings.TrimSpace(m.Payload)
+	username := "N/A"
+	if m.Sender.Username != "" {
+		username = "@" + m.Sender.Username
+	}
+	msg := fmt.Sprintf("Unban request\nID: %d\nUsername: %s\nReason: %s", m.Sender.ID, username, reason)
+	if reason == "" {
+		msg = fmt.Sprintf("Unban request\nID: %d\nUsername: %s\n(no reason)", m.Sender.ID, username)
+	}
+	markup := &tb.ReplyMarkup{}
+	btnUnban := markup.Data("✅ Unban", "unban", strconv.FormatInt(m.Sender.ID, 10))
+	markup.Inline(markup.Row(btnUnban))
+	if _, err := c.Bot().Send(&tb.User{ID: d.adminID}, msg, markup); err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not notify admin. Try again later.")
+	}
+	return c.Reply("Unban request sent to the admin.")
+}
+
+func (d DistorterBot) handleBanCallback(c tb.Context) error {
+	cb := c.Callback()
+	if cb == nil || cb.Sender == nil || cb.Sender.ID != d.adminID {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Unauthorized", ShowAlert: true})
+		return nil
+	}
+	args := c.Args()
+	if len(args) < 1 {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
+		return nil
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id == 0 {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
+		return nil
+	}
+	ok, err := d.db.BanUser(id)
+	if err != nil {
+		d.logger.Error(err)
+		_ = c.Respond(&tb.CallbackResponse{Text: "Error", ShowAlert: true})
+		return nil
+	}
+	if !ok {
+		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d already banned", id), ShowAlert: true})
+		return nil
+	}
+	d.videoWorker.BanUser(id)
+	if cb.Message != nil {
+		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been banned")
+	}
+	return c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("Banned %d", id), ShowAlert: true})
+}
+
+func (d DistorterBot) handleUnbanCallback(c tb.Context) error {
+	cb := c.Callback()
+	if cb == nil || cb.Sender == nil || cb.Sender.ID != d.adminID {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Unauthorized", ShowAlert: true})
+		return nil
+	}
+	args := c.Args()
+	if len(args) < 1 {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
+		return nil
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id == 0 {
+		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
+		return nil
+	}
+	ok, err := d.db.UnbanUser(id)
+	if err != nil {
+		d.logger.Error(err)
+		_ = c.Respond(&tb.CallbackResponse{Text: "Error", ShowAlert: true})
+		return nil
+	}
+	if !ok {
+		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d was not banned", id), ShowAlert: true})
+		return nil
+	}
+	if cb.Message != nil {
+		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been unbanned")
+	}
+	return c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("Unbanned %d", id), ShowAlert: true})
+}
+
+func (d DistorterBot) handleStatus(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
+		return nil
+	}
+	qLen, qUsers := d.videoWorker.QueueStats()
+	uptime := time.Since(d.startedAt).Truncate(time.Second)
+	version := VersionString()
+	return c.Reply(fmt.Sprintf(
+		"ok\nversion: %s\nuptime: %s\nqueue: %d jobs from %d users\nmaintenance: %v\ncodec: %s",
+		version, uptime, qLen, qUsers, d.videoWorker.Maintenance(), d.codec,
+	))
 }
 
 func findUpdateScript() string {
@@ -489,12 +725,15 @@ func (d DistorterBot) handleMaintenance(c tb.Context) error {
 
 func skipStatCommand(text string) bool {
 	switch {
-	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update":
+	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update", text == "/status",
+		text == "/ban", text == "/unban", text == "/bannedusers", text == "/unbanrequest", text == "/start":
 		return true
-	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/update@"):
+	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/ramp"), strings.HasPrefix(text, "/update@"),
+		strings.HasPrefix(text, "/ban"), strings.HasPrefix(text, "/unban"), strings.HasPrefix(text, "/bannedusers"),
+		strings.HasPrefix(text, "/unbanrequest"), strings.HasPrefix(text, "/start@"):
 		return true
 	case strings.HasPrefix(text, "/daily@"), strings.HasPrefix(text, "/weekly@"), strings.HasPrefix(text, "/monthly@"),
-		strings.HasPrefix(text, "/queue@"), strings.HasPrefix(text, "/maintenance@"):
+		strings.HasPrefix(text, "/queue@"), strings.HasPrefix(text, "/maintenance@"), strings.HasPrefix(text, "/status@"):
 		return true
 	default:
 		return false
@@ -548,10 +787,11 @@ func main() {
 		videoWorker: tools.NewVideoWorker(3, priorityChats),
 		codec:       codec,
 		db:          db,
+		startedAt:   time.Now(),
 	}
 	b.Poller = tb.NewMiddlewarePoller(&tb.LongPoller{Timeout: 10 * time.Second}, func(update *tb.Update) bool {
 		if update.Message == nil {
-			return false
+			return true // allow callbacks / non-message updates
 		}
 		m := update.Message
 		isCommand := len(m.Entities) > 0 && m.Entities[0].Type == tb.EntityCommand
@@ -562,6 +802,12 @@ func main() {
 		// throw away old messages
 		if time.Now().Sub(m.Time()) > 2*time.Hour {
 			return false
+		}
+		if m.Sender != nil && m.Sender.ID != adminID && db.IsBanned(m.Sender.ID) {
+			if !(strings.HasPrefix(text, "/unbanrequest")) {
+				b.Reply(m, "You are banned from using this bot.\n\nUse /unbanrequest to request an unban.")
+				return false
+			}
 		}
 		if m.FromGroup() {
 			chat, err := b.ChatByID(m.Chat.ID)
@@ -592,12 +838,21 @@ func main() {
 	}
 
 	b.Use(middleware.Recover())
-	b.Handle("/start", func(c tb.Context) error {
-		return c.Reply("Send me a picture, a sticker, a voice message, a video[note] or a GIF and I'll distort it. Use /intensity (1 to 100) to tune how strong the effect is.")
-	})
+	b.Handle("/start", d.handleStart)
 
 	b.Handle("/intensity", d.handleIntensity)
+	b.Handle("/ramp", d.handleRamp)
+	b.Handle("/status", d.handleStatus)
 	b.Handle("/update", d.handleUpdate)
+	b.Handle("/ban", d.handleBanCommand)
+	b.Handle("/unban", d.handleUnbanCommand)
+	b.Handle("/bannedusers", d.handleBannedUsers)
+	b.Handle("/unbanrequest", d.handleUnbanRequest)
+
+	banBtn := &tb.InlineButton{Unique: "ban"}
+	unbanBtn := &tb.InlineButton{Unique: "unban"}
+	b.Handle(banBtn, d.handleBanCallback)
+	b.Handle(unbanBtn, d.handleUnbanCallback)
 
 	b.Handle("/daily", d.ApplyShutdownMiddleware(func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Daily)

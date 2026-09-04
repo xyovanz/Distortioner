@@ -7,10 +7,7 @@ import (
 
 func DistortText(text string, intensity int) string {
 	i := clampIntensity(intensity)
-	stride := 1
-	if i < 50 {
-		stride += (49 - i) / 13
-	}
+	stride := TextStride(i)
 	count := 0
 	var b strings.Builder
 	idx := 0
@@ -28,4 +25,14 @@ func DistortText(text string, intensity int) string {
 		}
 	}
 	return b.String()
+}
+
+// TextStride is how often characters are case-flipped (1 = every char).
+func TextStride(intensity int) int {
+	i := clampIntensity(intensity)
+	stride := 1
+	if i < 50 {
+		stride += (49 - i) / 13
+	}
+	return stride
 }

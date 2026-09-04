@@ -1,6 +1,7 @@
 package distorters
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -28,6 +29,13 @@ const (
 	TooBig             = "Senpai, it's too big.."
 	Queued             = "Your message has been queued"
 )
+
+func FormatQueued(position int) string {
+	if position < 1 {
+		return Queued
+	}
+	return fmt.Sprintf("%s (position %d)", Queued, position)
+}
 
 func IsFailureStatus(text string) bool {
 	switch text {
@@ -68,7 +76,7 @@ func UserFacingError(err error) string {
 	}
 }
 
-func DistortVideo(filename, codec, output string, intensity int, progressChan chan string) {
+func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo int, progressChan chan string) {
 	progressChan <- "Extracting frames..."
 	defer close(progressChan)
 	framesDir := filename + "Frames"
@@ -97,7 +105,7 @@ func DistortVideo(filename, codec, output string, intensity int, progressChan ch
 
 	distortedFrames := 0
 	doneChan := make(chan int, 8)
-	go poolDistortImages(framesDir, doneChan, intensity)
+	go poolDistortImages(framesDir, doneChan, intensity, rampFrom, rampTo)
 
 	lastUpdate := time.Now()
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
@@ -131,13 +139,22 @@ func GetFrameRateFractionAndDuration(filename string) (string, float64, error) {
 		"-show_entries", "format=duration",
 		filename)
 	setProcessGroup(cmd)
+	var errbuf bytes.Buffer
+	cmd.Stderr = &errbuf
 	output, err := cmd.Output()
 	if err != nil {
-		err = errors.WithStack(err)
-		log.Println(err)
-		return "", 0, err
+		stderr := truncateLog(errbuf.String(), ffmpegStderrLimit)
+		last := lastNonEmptyLine(stderr)
+		log.Printf("ffprobe failed exit=%v file=%q stderr=%q", err, filename, stderr)
+		if last != "" {
+			return "", 0, errors.Wrapf(err, "ffprobe: %s", last)
+		}
+		return "", 0, errors.WithStack(err)
 	}
 	split := strings.Split(string(output), "\n")
+	if len(split) < 2 {
+		return "", 0, errors.New(FailedProbe)
+	}
 	duration, err := strconv.ParseFloat(split[1], 32)
 	if err != nil {
 		err = errors.WithStack(err)
@@ -184,7 +201,7 @@ func collectFramesToVideoSticker(numberedFileName, frameRateFraction, filename s
 		filename)
 }
 
-func poolDistortImages(frameDir string, doneChan chan int, intensity int) {
+func poolDistortImages(frameDir string, doneChan chan int, intensity, rampFrom, rampTo int) {
 	cpuCount := runtime.NumCPU()
 	sem := make(chan bool, cpuCount)
 	frames, err := os.ReadDir(frameDir)
@@ -205,7 +222,7 @@ func poolDistortImages(frameDir string, doneChan chan int, intensity int) {
 				<-sem
 				doneChan <- 1
 			}()
-			frameIntensity := ProgressiveIntensity(intensity, i, total)
+			frameIntensity := FrameIntensity(intensity, rampFrom, rampTo, i, total)
 			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame), frameIntensity)
 			if err != nil {
 				doneChan <- -1

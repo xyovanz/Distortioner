@@ -3,23 +3,29 @@
 
 Telegram bot for distorting pictures, stickers, voice messages and GIFs using Content Aware Scale.
 
-Fork of the original Distortioner with per-user `/intensity` and admin `/update`.
+Fork of the original Distortioner with per-user `/intensity`, optional `/ramp`, and admin `/update`.
 
 ## Usage
 1. You'll need to install [ffmpeg](http://ffmpeg.org) and [ImageMagick](http://www.imagemagick.org/) with liquid-rescale enabled (liblqr + glib), or use Docker.
 2. Create a bot with [@BotFather](https://t.me/BotFather), then set `DISTORTIONER_BOT_TOKEN`.
-3. Set `DISTORTIONER_ADMIN_ID` (stats commands, `/maintenance`, `/queue`, `/update`).
+3. Set `DISTORTIONER_ADMIN_ID` (stats commands, `/maintenance`, `/queue`, `/status`, `/update`).
 4. Build with `go build` in `app/`, or use Docker below.
 
 ### User commands
 - Send media / text, or reply with `/distort`
 - `/intensity` — show current strength (1–100, default 50)
 - `/intensity <n>` — set strength
+- `/ramp` — toggle progressive frame distortion (per-user; off by default)
+- `/ramp <from> <to>` — set progressive endpoints and enable
+- `/ramp off` — disable progressive ramp
+- `/unbanrequest [reason]` — ask admin to lift a ban
 
 ### Admin commands
 - `/daily`, `/weekly`, `/monthly` — usage stats
 - `/queue` — video queue size
+- `/status` — version, uptime, queue, maintenance
 - `/maintenance` — toggle maintenance mode
+- `/ban <id>` / `/unban <id>` / `/bannedusers` — persistent bans (also Ban button on `/start` alerts)
 - `/update [branch]` — pull git, rebuild image, recreate container (default branch: `wip`, override with `DISTORTIONER_UPDATE_BRANCH`)
 
 ## Docker support

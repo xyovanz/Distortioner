@@ -9,7 +9,8 @@ import (
 func TestHonestJobQueue_InsertionOrder(t *testing.T) {
 	hjq := NewHonestJobQueue(50, []int64{})
 	for id := int64(1); id < 4; id++ {
-		hjq.Push(id, func() {})
+		_, err := hjq.Push(id, func() {})
+		assert.NoError(t, err)
 	}
 	assert.Equal(t, 3, hjq.Len())
 	for id := int64(1); id < 4; id++ {
@@ -24,13 +25,16 @@ func TestHonestJobQueue_RepeatUsers(t *testing.T) {
 
 	// three jobs by user 1
 	for i := 0; i < 3; i++ {
-		hjq.Push(1, func() {})
+		_, err := hjq.Push(1, func() {})
+		assert.NoError(t, err)
 	}
 	// one job from user 3
-	hjq.Push(3, func() {})
+	_, err := hjq.Push(3, func() {})
+	assert.NoError(t, err)
 	// two jobs from user 2
 	for i := 0; i < 2; i++ {
-		hjq.Push(2, func() {})
+		_, err := hjq.Push(2, func() {})
+		assert.NoError(t, err)
 	}
 
 	assert.Equal(t, 6, hjq.Len())
@@ -48,10 +52,14 @@ func TestHonestJobQueue_RepeatUsers(t *testing.T) {
 func TestHonestJobQueue_BanSkipsOnlyBannedUser(t *testing.T) {
 	hjq := NewHonestJobQueue(50, []int64{})
 
-	assert.NoError(t, hjq.Push(1, func() {}))
-	assert.NoError(t, hjq.Push(1, func() {}))
-	assert.NoError(t, hjq.Push(2, func() {}))
-	assert.NoError(t, hjq.Push(3, func() {}))
+	_, err := hjq.Push(1, func() {})
+	assert.NoError(t, err)
+	_, err = hjq.Push(1, func() {})
+	assert.NoError(t, err)
+	_, err = hjq.Push(2, func() {})
+	assert.NoError(t, err)
+	_, err = hjq.Push(3, func() {})
+	assert.NoError(t, err)
 
 	hjq.BanUser(1)
 
@@ -67,9 +75,26 @@ func TestHonestJobQueue_BanSkipsOnlyBannedUser(t *testing.T) {
 	assert.Equal(t, 0, hjq.Len())
 
 	// Ban lifts after banned user's jobs are exhausted; they can enqueue again.
-	assert.NoError(t, hjq.Push(1, func() {}))
+	_, err = hjq.Push(1, func() {})
+	assert.NoError(t, err)
 	revived := hjq.Pop()
 	if assert.NotNil(t, revived) {
 		assert.Equal(t, int64(1), revived.userID)
 	}
+}
+
+func TestHonestJobQueue_Position(t *testing.T) {
+	hjq := NewHonestJobQueue(50, []int64{})
+	pos1, err := hjq.Push(1, func() {})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, pos1)
+	pos2, err := hjq.Push(2, func() {})
+	assert.NoError(t, err)
+	assert.Equal(t, 2, pos2)
+	pos3, err := hjq.Push(3, func() {})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, pos3)
+	assert.Equal(t, 1, hjq.Position(1))
+	assert.Equal(t, 2, hjq.Position(2))
+	assert.Equal(t, 3, hjq.Position(3))
 }

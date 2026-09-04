@@ -17,6 +17,7 @@ type HonestJobQueue struct {
 	banned        map[int64]any // Drop jobs from these users
 	maintenance   bool
 	priorityChats map[int64]any // not very honest of an honest job queue, but I don't care, I'm not waiting with everybody else
+	seq           int64         // stable tie-break when insertion times collide
 }
 
 func NewHonestJobQueue(initialCapacity int, priorityChats []int64) *HonestJobQueue {
@@ -44,16 +45,18 @@ func (hjq *HonestJobQueue) BanUser(userID int64) {
 }
 
 func (hjq *HonestJobQueue) updatePriorities(userID int64) {
-	for i, job := range hjq.queue {
+	now := time.Now()
+	for _, job := range hjq.queue {
 		if job.userID != userID {
 			continue
 		}
 		job.priority--
-		// I don't want very active users to get stuck forever with lower priority, but I DO want them to "re-enter" the queue
-		job.insertionTime = time.Now()
-		// It's fine to do Fix here, the job will always get moved to the _left_, we won't see the same job twice
-		heap.Fix(&hjq.queue, i)
+		// Re-enter fairly: bump seq so equal-timestamp ties (common on Windows) lose to older jobs.
+		hjq.seq++
+		job.seq = hjq.seq
+		job.insertionTime = now
 	}
+	heap.Init(&hjq.queue)
 }
 
 func (hjq *HonestJobQueue) Len() int {
@@ -68,6 +71,54 @@ func (hjq *HonestJobQueue) Stats() (int, int) {
 	defer hjq.mu.RUnlock()
 
 	return len(hjq.queue), len(hjq.users)
+}
+
+// Position returns 1-based queue position for the user's earliest job, or 0 if none.
+func (hjq *HonestJobQueue) Position(userID int64) int {
+	hjq.mu.RLock()
+	defer hjq.mu.RUnlock()
+	return hjq.positionLocked(userID)
+}
+
+func (hjq *HonestJobQueue) positionLocked(userID int64) int {
+	var target *Job
+	for _, job := range hjq.queue {
+		if job.userID != userID {
+			continue
+		}
+		if target == nil || jobBefore(job, target) {
+			target = job
+		}
+	}
+	if target == nil {
+		return 0
+	}
+	pos := 1
+	for _, job := range hjq.queue {
+		if job == target {
+			continue
+		}
+		if jobBefore(job, target) {
+			pos++
+		}
+	}
+	return pos
+}
+
+func jobBefore(a, b *Job) bool {
+	if a.priority != b.priority {
+		return a.priority < b.priority
+	}
+	if !a.insertionTime.Equal(b.insertionTime) {
+		return a.insertionTime.Before(b.insertionTime)
+	}
+	return a.seq < b.seq
+}
+
+func (hjq *HonestJobQueue) Maintenance() bool {
+	hjq.mu.RLock()
+	defer hjq.mu.RUnlock()
+	return hjq.maintenance
 }
 
 func (hjq *HonestJobQueue) dropBannedJob(userID int64) {
@@ -114,16 +165,16 @@ func (hjq *HonestJobQueue) ToggleMaintenance() bool {
 	return hjq.maintenance
 }
 
-func (hjq *HonestJobQueue) Push(userID int64, runnable func()) error {
+func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 	hjq.mu.Lock()
 	defer hjq.mu.Unlock()
 
 	if hjq.maintenance {
-		return errors.New("The server is on temporary maintenance, no new videos are being processed at the moment, try again later")
+		return 0, errors.New("The server is on temporary maintenance, no new videos are being processed at the moment, try again later")
 	}
 
 	if hjq.queue.Len() > 2000 {
-		return errors.New("There are too many items queued already, try again later")
+		return 0, errors.New("There are too many items queued already, try again later")
 	}
 	priority := hjq.users[userID]
 	_, ok := hjq.priorityChats[userID]
@@ -133,7 +184,7 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) error {
 
 	if priority > 2 {
 		hjq.users[userID]--
-		return errors.New("You're distorting videos too often, wait until the previous ones have been processed")
+		return 0, errors.New("You're distorting videos too often, wait until the previous ones have been processed")
 	}
 
 	// if a user sent us a message then we're clearly unbanned
@@ -143,8 +194,8 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) error {
 
 	hjq.users[userID] = priority + 1
 
-	job := newJob(userID, priority, runnable)
-	heap.Push(&hjq.queue, &job)
+	hjq.seq++
+	heap.Push(&hjq.queue, newJob(userID, priority, hjq.seq, runnable))
 
-	return nil
+	return hjq.positionLocked(userID), nil
 }
