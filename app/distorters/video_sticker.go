@@ -2,33 +2,32 @@ package distorters
 
 import (
 	"fmt"
-	"log"
 	"os"
-	"sync"
 
 	"github.com/pkg/errors"
 )
 
-func DistortVideoSticker(filename, output string, intensity int, group *sync.WaitGroup) {
-	defer group.Done()
+// DistortVideoSticker rasterizes a VP9/webm sticker, applies progressive liquid-rescale, and re-encodes webm+alpha.
+func DistortVideoSticker(filename, output string, intensity int) error {
 	framesDir := filename + "Frames"
 	err := os.Mkdir(framesDir, 0755)
 	if err != nil {
-		err = errors.WithStack(err)
-		log.Println(err)
-		return
+		return errors.WithStack(err)
 	}
 	defer os.RemoveAll(framesDir)
+
 	frameRateFraction, duration, err := GetFrameRateFractionAndDuration(filename)
 	if err != nil {
-		return
-	} else if duration > 30 {
-		return
+		return errors.Wrap(err, FailedProbe)
 	}
+	if duration > 30 {
+		return errors.New(TooLong)
+	}
+
 	numberedFileName := fmt.Sprintf("%s/%s%%04d.png", framesDir, filename)
 	err = extractFramesFromVideoSticker(frameRateFraction, filename, numberedFileName)
 	if err != nil {
-		return
+		return errors.Wrap(err, FailedExtract)
 	}
 
 	distortedFrames := 0
@@ -38,13 +37,14 @@ func DistortVideoSticker(filename, output string, intensity int, group *sync.Wai
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
 		if framesDistorted == -1 {
-			return
+			return errors.New(FailedDistortImage)
 		}
 		distortedFrames += framesDistorted
 	}
+
 	err = collectFramesToVideoSticker(numberedFileName, frameRateFraction, output)
 	if err != nil {
-		log.Println(err)
+		return errors.Wrap(err, FailedEncode)
 	}
-	return
+	return nil
 }

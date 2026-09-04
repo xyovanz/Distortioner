@@ -6,9 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -130,9 +130,7 @@ func GetFrameRateFractionAndDuration(filename string) (string, float64, error) {
 		"-show_entries", "stream=avg_frame_rate",
 		"-show_entries", "format=duration",
 		filename)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	setProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		err = errors.WithStack(err)
@@ -195,7 +193,11 @@ func poolDistortImages(frameDir string, doneChan chan int, intensity int) {
 		doneChan <- -1
 		return
 	}
-	doneChan <- len(frames)
+	sort.Slice(frames, func(i, j int) bool {
+		return frames[i].Name() < frames[j].Name()
+	})
+	total := len(frames)
+	doneChan <- total
 	for i, frame := range frames {
 		sem <- true
 		go func(i int, frame string) {
@@ -203,7 +205,8 @@ func poolDistortImages(frameDir string, doneChan chan int, intensity int) {
 				<-sem
 				doneChan <- 1
 			}()
-			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame), intensity)
+			frameIntensity := ProgressiveIntensity(intensity, i, total)
+			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame), frameIntensity)
 			if err != nil {
 				doneChan <- -1
 			}
