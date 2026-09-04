@@ -17,11 +17,56 @@ import (
 )
 
 const (
-	Failed  = "Failed"
-	TooLong = "Senpai, it's too long.."
-	TooBig  = "Senpai, it's too big.."
-	Queued  = "Your message has been queued"
+	Failed             = "Failed to process media"
+	FailedProbe        = "Failed to read video"
+	FailedExtract      = "Failed to extract video frames"
+	FailedDistortImage = "Failed to distort image"
+	FailedEncode       = "Failed to encode video"
+	FailedDistortAudio = "Failed to distort audio"
+	FailedDownload     = "Failed to download media"
+	TooLong            = "Senpai, it's too long.."
+	TooBig             = "Senpai, it's too big.."
+	Queued             = "Your message has been queued"
 )
+
+func IsFailureStatus(text string) bool {
+	switch text {
+	case Failed, FailedProbe, FailedExtract, FailedDistortImage, FailedEncode, FailedDistortAudio, FailedDownload, TooLong, TooBig:
+		return true
+	default:
+		return false
+	}
+}
+
+// UserFacingError maps an error to a short Telegram-facing status string.
+func UserFacingError(err error) string {
+	if err == nil {
+		return Failed
+	}
+	msg := err.Error()
+	switch {
+	case msg == TooLong || strings.Contains(msg, TooLong):
+		return TooLong
+	case msg == TooBig || strings.Contains(msg, TooBig):
+		return TooBig
+	case strings.Contains(msg, FailedProbe), strings.Contains(msg, "ffprobe"):
+		return FailedProbe
+	case strings.Contains(msg, FailedExtract):
+		return FailedExtract
+	case strings.Contains(msg, FailedDistortImage), strings.Contains(msg, "magick"), strings.Contains(msg, "liquid"):
+		return FailedDistortImage
+	case strings.Contains(msg, FailedEncode), strings.Contains(msg, "libx264"), strings.Contains(msg, "encode"):
+		return FailedEncode
+	case strings.Contains(msg, FailedDistortAudio), strings.Contains(msg, "vibrato"):
+		return FailedDistortAudio
+	case strings.Contains(msg, "download"), strings.Contains(msg, FailedDownload):
+		return FailedDownload
+	case IsFailureStatus(msg):
+		return msg
+	default:
+		return Failed
+	}
+}
 
 func DistortVideo(filename, codec, output string, intensity int, progressChan chan string) {
 	progressChan <- "Extracting frames..."
@@ -31,12 +76,13 @@ func DistortVideo(filename, codec, output string, intensity int, progressChan ch
 	if err != nil {
 		err = errors.WithStack(err)
 		log.Println(err)
+		progressChan <- Failed
 		return
 	}
 	defer os.RemoveAll(framesDir)
 	frameRateFraction, duration, err := GetFrameRateFractionAndDuration(filename)
 	if err != nil {
-		progressChan <- Failed
+		progressChan <- FailedProbe
 		return
 	} else if duration > 60 {
 		progressChan <- TooLong
@@ -45,7 +91,7 @@ func DistortVideo(filename, codec, output string, intensity int, progressChan ch
 	numberedFileName := fmt.Sprintf("%s/%s%%04d.png", framesDir, filename)
 	err = extractFramesFromVideo(frameRateFraction, filename, numberedFileName)
 	if err != nil {
-		progressChan <- Failed
+		progressChan <- FailedExtract
 		return
 	}
 
@@ -57,7 +103,7 @@ func DistortVideo(filename, codec, output string, intensity int, progressChan ch
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
 		if framesDistorted == -1 {
-			progressChan <- Failed
+			progressChan <- FailedDistortImage
 			return
 		}
 		distortedFrames += framesDistorted
@@ -70,7 +116,7 @@ func DistortVideo(filename, codec, output string, intensity int, progressChan ch
 	progressChan <- "Collecting frames..."
 	err = collectFramesToVideo(numberedFileName, frameRateFraction, codec, output)
 	if err != nil {
-		progressChan <- Failed
+		progressChan <- FailedEncode
 	}
 	return
 }
