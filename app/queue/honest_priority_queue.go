@@ -70,31 +70,39 @@ func (hjq *HonestJobQueue) Stats() (int, int) {
 	return len(hjq.queue), len(hjq.users)
 }
 
+func (hjq *HonestJobQueue) dropBannedJob(userID int64) {
+	hjq.users[userID]--
+	if hjq.users[userID] <= 0 {
+		delete(hjq.users, userID)
+		// All of this user's queued jobs are gone; lift the ban.
+		delete(hjq.banned, userID)
+	}
+}
+
 func (hjq *HonestJobQueue) Pop() *Job {
 	hjq.mu.Lock()
 	defer hjq.mu.Unlock()
 
-	if hjq.queue.Len() == 0 {
-		return nil
-	}
-	job := heap.Pop(&hjq.queue).(*Job)
-
-	for _, ok := hjq.banned[job.userID]; ok; {
+	for {
 		if hjq.queue.Len() == 0 {
 			return nil
 		}
-		job = heap.Pop(&hjq.queue).(*Job)
+		job := heap.Pop(&hjq.queue).(*Job)
+
+		if _, banned := hjq.banned[job.userID]; banned {
+			// Skip this job only; do not drain unrelated users' work.
+			hjq.dropBannedJob(job.userID)
+			continue
+		}
+
+		hjq.users[job.userID]--
+		if hjq.users[job.userID] == 0 {
+			delete(hjq.users, job.userID)
+		}
+
+		hjq.updatePriorities(job.userID)
+		return job
 	}
-
-	hjq.users[job.userID]--
-
-	if hjq.users[job.userID] == 0 {
-		delete(hjq.users, job.userID)
-	}
-
-	hjq.updatePriorities(job.userID)
-
-	return job
 }
 
 func (hjq *HonestJobQueue) ToggleMaintenance() bool {
