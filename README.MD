@@ -26,13 +26,18 @@ Fork of the original Distortioner with per-user `/intensity` and admin `/update`
 Fill out `distortioner.env`, then build and run locally:
 
 ```Bash
-docker build -t distortioner:local .
+# After pulling new code, rebuild without cache if layers stay CACHED:
+docker build --no-cache -t distortioner:local .
+sudo docker stop distortioner; sudo docker rm distortioner
 sudo docker run -d --restart unless-stopped \
    --name distortioner \
    --env-file distortioner.env \
    -v /path/to/database/directory:/app/data \
    distortioner:local
+sudo docker logs -f distortioner
 ```
+
+The bot writes SQLite under `/app/data` (cwd `/app`). The volume mount must be `…:/app/data`.
 
 Or after publishing your own image:
 
