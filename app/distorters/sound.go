@@ -6,11 +6,9 @@ import (
 	"strings"
 )
 
-func DistortSound(filename, output string, intensity int) error {
+func soundFilterParts(intensity int) []string {
 	i := clampIntensity(intensity)
-	// ffmpeg vibrato depth must be in [0, 1]. Intensity 50 ≈ original d=1.
-	depth := math.Min(1.0, 0.1+0.018*float64(i))
-	freq := 2.0 + 0.08*float64(i)
+	depth, freq := VibratoParams(i)
 	parts := []string{fmt.Sprintf("vibrato=f=%.3f:d=%.3f", freq, depth)}
 
 	// Above 50, depth is already maxed — add tremolo / chorus / slight pitch for extra punch.
@@ -23,11 +21,22 @@ func DistortSound(filename, output string, intensity int) error {
 			parts = append(parts, fmt.Sprintf("asetrate=48000*%.4f,aresample=48000", pitch))
 		}
 	}
+	return parts
+}
 
+// VibratoParams returns ffmpeg vibrato depth [0,1] and frequency for intensity 1–100.
+func VibratoParams(intensity int) (depth, freq float64) {
+	i := clampIntensity(intensity)
+	depth = math.Min(1.0, 0.1+0.018*float64(i))
+	freq = 2.0 + 0.08*float64(i)
+	return depth, freq
+}
+
+func DistortSound(filename, output string, intensity int) error {
 	return runFfmpeg(
 		"-i", filename,
 		"-vn",
 		"-c:a", "libopus",
-		"-af", strings.Join(parts, ","),
+		"-af", strings.Join(soundFilterParts(intensity), ","),
 		output)
 }

@@ -19,11 +19,12 @@ func clampIntensity(i int) int {
 	return i
 }
 
-// ProgressiveIntensity ramps distortion from ~40% of base up to base across frames (index 0..total-1).
-func ProgressiveIntensity(base, index, total int) int {
-	base = clampIntensity(base)
-	if total <= 1 {
-		return base
+// ProgressiveIntensity ramps distortion linearly from→to across frames (index 0..total-1).
+func ProgressiveIntensity(from, to, index, total int) int {
+	from = clampIntensity(from)
+	to = clampIntensity(to)
+	if total <= 1 || from == to {
+		return from
 	}
 	if index < 0 {
 		index = 0
@@ -31,12 +32,16 @@ func ProgressiveIntensity(base, index, total int) int {
 	if index >= total {
 		index = total - 1
 	}
-	start := base * 2 / 5
-	if start < 1 {
-		start = 1
-	}
 	t := float64(index) / float64(total-1)
-	return clampIntensity(start + int(math.Round(t*float64(base-start))))
+	return clampIntensity(from + int(math.Round(t*float64(to-from))))
+}
+
+// FrameIntensity uses flat intensity unless a /ramp from→to is enabled (rampFrom >= 1).
+func FrameIntensity(flat, rampFrom, rampTo, index, total int) int {
+	if rampFrom < 1 {
+		return clampIntensity(flat)
+	}
+	return ProgressiveIntensity(rampFrom, rampTo, index, total)
 }
 
 func liquidRescaleFraction(intensity int) (liquid float64, resizeStretch float64) {

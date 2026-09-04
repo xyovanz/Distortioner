@@ -25,7 +25,7 @@ const (
 	Send
 )
 
-func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Message, string, string, error) {
+func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity, rampFrom, rampTo int) (*tb.Message, string, string, error) {
 	m := c.Message()
 	b := c.Bot()
 	progressMessage, err := d.SendMessage(c, "Downloading...", Reply)
@@ -40,7 +40,7 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Me
 	}
 	animationOutput := filename + ".mp4"
 	progressChan := make(chan string, 3)
-	go distorters.DistortVideo(filename, d.codec, animationOutput, intensity, progressChan)
+	go distorters.DistortVideo(filename, d.codec, animationOutput, intensity, rampFrom, rampTo, progressChan)
 	for report := range progressChan {
 		if progressMessage == nil {
 			continue
@@ -60,8 +60,8 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity int) (*tb.Me
 	return progressMessage, filename, animationOutput, nil
 }
 
-func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity int) (string, *tb.Message, error) {
-	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c, intensity)
+func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity, rampFrom, rampTo int) (string, *tb.Message, error) {
+	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c, intensity, rampFrom, rampTo)
 	failed := err != nil
 	defer tools.RemoveTemp(filename, failed)
 	if failed {
@@ -89,14 +89,14 @@ func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity int) (string, *t
 	return output, progressMessage, nil
 }
 
-func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity int) (string, string, error) {
+func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity, rampFrom, rampTo int) (string, string, error) {
 	filename, err := tools.JustGetTheFile(c.Bot(), c.Message())
 	if err != nil {
 		d.logger.Error(err)
 		return "", "", errors.New(distorters.FailedDownload)
 	}
 	animationOutput := filename + ".webm"
-	err = distorters.DistortVideoSticker(filename, animationOutput, intensity)
+	err = distorters.DistortVideoSticker(filename, animationOutput, intensity, rampFrom, rampTo)
 	if err != nil {
 		return filename, animationOutput, err
 	}

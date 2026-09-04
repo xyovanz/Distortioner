@@ -36,13 +36,13 @@ func (vw *VideoWorker) run() {
 	}
 }
 
-func (vw *VideoWorker) Submit(userID int64, runnable func()) error {
-	err := vw.queue.Push(userID, runnable)
+func (vw *VideoWorker) Submit(userID int64, runnable func()) (int, error) {
+	pos, err := vw.queue.Push(userID, runnable)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	vw.messenger <- nil // let goroutines know that there's something in the queue
-	return nil
+	return pos, nil
 }
 
 func (vw *VideoWorker) Shutdown() {
@@ -53,10 +53,18 @@ func (vw *VideoWorker) QueueStats() (int, int) {
 	return vw.queue.Stats()
 }
 
+func (vw *VideoWorker) QueuePosition(userID int64) int {
+	return vw.queue.Position(userID)
+}
+
 func (vw *VideoWorker) IsBusy() bool {
 	return vw.queue.Len() > vw.workerCount
 }
 
 func (vw *VideoWorker) ToggleMaintenance() bool {
 	return vw.queue.ToggleMaintenance()
+}
+
+func (vw *VideoWorker) Maintenance() bool {
+	return vw.queue.Maintenance()
 }

@@ -7,8 +7,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-// DistortVideoSticker rasterizes a VP9/webm sticker, applies progressive liquid-rescale, and re-encodes webm+alpha.
-func DistortVideoSticker(filename, output string, intensity int) error {
+// DistortVideoSticker rasterizes a VP9/webm sticker, applies liquid-rescale per frame, and re-encodes webm+alpha.
+func DistortVideoSticker(filename, output string, intensity, rampFrom, rampTo int) error {
 	framesDir := filename + "Frames"
 	err := os.Mkdir(framesDir, 0755)
 	if err != nil {
@@ -32,7 +32,7 @@ func DistortVideoSticker(filename, output string, intensity int) error {
 
 	distortedFrames := 0
 	doneChan := make(chan int, 8)
-	go poolDistortImages(framesDir, doneChan, intensity)
+	go poolDistortImages(framesDir, doneChan, intensity, rampFrom, rampTo)
 
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
