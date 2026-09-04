@@ -140,8 +140,37 @@ func (d DistorterBot) handleRegularStickerDistortion(c tb.Context, intensity int
 	return d.SendMessageWithRepeater(c, distorted)
 }
 
-func (d DistorterBot) handleVideoStickerDistortion(c tb.Context) error {
-	return c.Reply("You can go vote for this suggestion, for .webm stickers handling to become somewhat tolerable https://bugs.telegram.org/c/14858")
+func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, intensity int) error {
+	m := c.Message()
+	if m.Sticker.FileSize > MaxSizeMb {
+		return d.SendMessageWithRepeater(c, distorters.TooBig)
+	} else if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
+		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
+	}
+
+	err := d.videoWorker.Submit(m.Chat.ID, func() {
+		filename, output, err := d.HandleVideoSticker(c, intensity)
+		failed := err != nil
+		defer tools.RemoveTemp(filename, failed)
+		defer tools.RemoveTemp(output, failed)
+		if failed {
+			d.logger.Error(err)
+			d.SendMessageWithRepeater(c, distorters.UserFacingError(err))
+			return
+		}
+		distorted := &tb.Sticker{File: tb.FromDisk(output)}
+		if sendErr := d.SendMessageWithRepeater(c, distorted); sendErr != nil {
+			d.logger.Error(sendErr)
+		}
+	})
+	if err != nil {
+		d.SendMessageWithRepeater(c, err.Error())
+		return nil
+	}
+	if d.videoWorker.IsBusy() {
+		d.SendMessageWithRepeater(c, distorters.Queued)
+	}
+	return nil
 }
 
 func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error {
@@ -149,9 +178,9 @@ func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error
 	var err error
 	switch {
 	case m.Sticker.Animated:
-		err = d.SendMessageWithRepeater(c, NotSupported)
+		err = d.SendMessageWithRepeater(c, AnimatedStickersUnsupported)
 	case m.Sticker.Video:
-		err = d.handleVideoStickerDistortion(c)
+		err = d.handleVideoStickerDistortion(c, intensity)
 	default:
 		err = d.handleRegularStickerDistortion(c, intensity)
 	}

@@ -82,7 +82,6 @@ The bot can see all group messages when privacy mode is off (needed for `/distor
 Temporary media files are deleted after processing. Set `DISTORTIONER_KEEP_FAILED=1` to keep files when a job fails (debugging).
 
 ## TODO
-* Distort animated stickers
-* Make distortion increase throughout the video
+* Distort animated stickers (.tgs / Lottie)
 * For stickers create and maintain a separate sticker pack for ease of use
-* Localization, refactoring, tests
+* Localization, refactoring, more tests

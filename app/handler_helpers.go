@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	tb "gopkg.in/telebot.v3"
@@ -16,6 +15,7 @@ import (
 const (
 	NotEnoughRights = "The bot does not have enough rights to send media to your chat"
 	NotSupported    = "Not supported yet, sorry"
+	AnimatedStickersUnsupported = "Animated stickers (.tgs) aren't supported — send a static or video sticker instead."
 )
 
 type MethodOfResponding = int
@@ -93,15 +93,17 @@ func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity int) (string, s
 	filename, err := tools.JustGetTheFile(c.Bot(), c.Message())
 	if err != nil {
 		d.logger.Error(err)
-		return "", "", err
+		return "", "", errors.New(distorters.FailedDownload)
 	}
 	animationOutput := filename + ".webm"
-	group := sync.WaitGroup{}
-	group.Add(1)
-	go distorters.DistortVideoSticker(filename, animationOutput, intensity, &group)
-	group.Wait()
-	_, err = os.Stat(animationOutput)
-	return filename, animationOutput, err
+	err = distorters.DistortVideoSticker(filename, animationOutput, intensity)
+	if err != nil {
+		return filename, animationOutput, err
+	}
+	if _, err = os.Stat(animationOutput); err != nil {
+		return filename, animationOutput, errors.New(distorters.FailedEncode)
+	}
+	return filename, animationOutput, nil
 }
 
 func (d DistorterBot) dealWithStatusMessage(b *tb.Bot, m *tb.Message, failMsg string) error {

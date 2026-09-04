@@ -2,9 +2,9 @@ package distorters
 
 import (
 	"log"
+	"math"
 	"os/exec"
 	"strconv"
-	"syscall"
 
 	"github.com/pkg/errors"
 )
@@ -17,6 +17,26 @@ func clampIntensity(i int) int {
 		return 100
 	}
 	return i
+}
+
+// ProgressiveIntensity ramps distortion from ~40% of base up to base across frames (index 0..total-1).
+func ProgressiveIntensity(base, index, total int) int {
+	base = clampIntensity(base)
+	if total <= 1 {
+		return base
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= total {
+		index = total - 1
+	}
+	start := base * 2 / 5
+	if start < 1 {
+		start = 1
+	}
+	t := float64(index) / float64(total-1)
+	return clampIntensity(start + int(math.Round(t*float64(base-start))))
 }
 
 func liquidRescaleFraction(intensity int) (liquid float64, resizeStretch float64) {
@@ -42,9 +62,7 @@ func DistortImage(path string, intensity int) error {
 		"-liquid-rescale", formatPercent(liquid),
 		"-resize", formatPercent(resizeStretch),
 		path)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	setProcessGroup(cmd)
 	err := cmd.Run()
 	if err != nil {
 		err = errors.WithStack(err)
