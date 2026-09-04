@@ -166,7 +166,7 @@ fi
 echo "🔄 Recreating container ${CONTAINER}..."
 docker stop "${CONTAINER}" >/dev/null 2>&1 || true
 docker rm "${CONTAINER}" >/dev/null 2>&1 || true
-# Mount the git checkout at the same host path and set workdir there so /update finds update.sh.
+# Keep workdir /app so SQLite uses the /app/data volume. Mount the repo so /update can run update.sh.
 docker run -d --restart unless-stopped \
   --name "${CONTAINER}" \
   --env-file "${ENV_FILE}" \
@@ -174,7 +174,8 @@ docker run -d --restart unless-stopped \
   -v "${DATA_DIR}:/app/data" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "${ROOT}:${ROOT}" \
-  -w "${ROOT}" \
+  -w /app \
+  --entrypoint /app/distortioner \
   "${IMAGE}"
 
 HEAD_SHA="$(git rev-parse --short HEAD)"

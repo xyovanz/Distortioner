@@ -11,4 +11,4 @@ FROM ghcr.io/graynk/ffmpegim AS release
 WORKDIR /app
 COPY --from=build /go/src/distortioner/distortioner distortioner
 
-ENTRYPOINT ["./distortioner"]
+ENTRYPOINT ["/app/distortioner"]
