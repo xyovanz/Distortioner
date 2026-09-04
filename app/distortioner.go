@@ -322,6 +322,28 @@ func (d DistorterBot) handleIntensity(c tb.Context) error {
 	return c.Reply(fmt.Sprintf("Intensity set to %d.", n))
 }
 
+func findUpdateScript() string {
+	candidates := []string{
+		os.Getenv("DISTORTIONER_UPDATE_SCRIPT"),
+		"update.sh",
+		"/src/update.sh",
+		"/repo/update.sh",
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "update.sh"))
+	}
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
 func (d DistorterBot) handleUpdate(c tb.Context) error {
 	m := c.Message()
 	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
@@ -332,18 +354,15 @@ func (d DistorterBot) handleUpdate(c tb.Context) error {
 		branch = os.Getenv("DISTORTIONER_UPDATE_BRANCH")
 	}
 	if branch == "" {
-		branch = "wip"
+		branch = "master"
 	}
 	if !safeBranchRe.MatchString(branch) {
 		return c.Reply("Invalid branch name.")
 	}
 
-	script := os.Getenv("DISTORTIONER_UPDATE_SCRIPT")
+	script := findUpdateScript()
 	if script == "" {
-		script = "update.sh"
-	}
-	if _, err := os.Stat(script); err != nil {
-		return c.Reply("update.sh not found. Mount the git checkout (or set DISTORTIONER_UPDATE_SCRIPT).")
+		return c.Reply("update.sh not found inside the container. Recreate with the repo mounted, e.g. -v /path/to/Distortioner:/path/to/Distortioner -w /path/to/Distortioner, and set DISTORTIONER_UPDATE_SCRIPT to that update.sh path. Or run ./update.sh on the host once.")
 	}
 
 	logPath := os.Getenv("DISTORTIONER_UPDATE_LOG")
@@ -362,11 +381,6 @@ func (d DistorterBot) handleUpdate(c tb.Context) error {
 
 	cmd := exec.Command("bash", script, branch)
 	cmd.Dir = filepath.Dir(script)
-	if cmd.Dir == "." || cmd.Dir == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cmd.Dir = wd
-		}
-	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = append(os.Environ(),
@@ -387,7 +401,7 @@ func (d DistorterBot) handleUpdate(c tb.Context) error {
 		_ = logFile.Close()
 	}()
 
-	return c.Reply(fmt.Sprintf("Checking origin/%s for updates…\nWill rebuild and recreate the container if needed.\nLog: %s", branch, logPath))
+	return c.Reply(fmt.Sprintf("Checking origin/%s for updates…\nScript: %s\nLog: %s", branch, script, logPath))
 }
 
 func (d DistorterBot) handleStatRequest(c tb.Context, db *stats.DistortionerDB, period stats.Period) error {

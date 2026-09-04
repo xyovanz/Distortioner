@@ -50,28 +50,31 @@ sudo docker run -d --restart unless-stopped \
 ```
 
 ### `/update` from inside Docker
-The bot must see the git checkout, Docker CLI, and the daemon socket, for example:
+The bot must see the git checkout, Docker CLI, and the daemon socket. **First time**, run `./update.sh` on the **host** from the repo (so mounts get set up), or recreate manually:
 
 ```Bash
+REPO=/path/to/Distortioner   # host path to this git checkout
+DATA=/path/to/database/directory  # host path — same as DISTORTIONER_DATA_DIR
+
 sudo docker run -d --restart unless-stopped \
    --name distortioner \
-   --env-file distortioner.env \
-   -v /path/to/database/directory:/app/data \
+   --env-file "$REPO/distortioner.env" \
+   -e DISTORTIONER_UPDATE_SCRIPT="$REPO/update.sh" \
+   -v "$DATA:/app/data" \
    -v /var/run/docker.sock:/var/run/docker.sock \
-   -v /path/to/Distortioner:/src \
-   -w /src \
+   -v "$REPO:$REPO" \
+   -w "$REPO" \
    distortioner:local
 ```
 
-Set in `distortioner.env` (or the environment):
-- `DISTORTIONER_UPDATE_BRANCH=wip`
+Set in `distortioner.env`:
+- `DISTORTIONER_UPDATE_BRANCH=master`
 - `DISTORTIONER_IMAGE=distortioner:local`
 - `DISTORTIONER_CONTAINER_NAME=distortioner`
-- `DISTORTIONER_DATA_DIR=/path/to/database/directory`
-- `DISTORTIONER_UPDATE_SCRIPT=/src/update.sh` (optional)
+- `DISTORTIONER_DATA_DIR=/path/to/database/directory` — **host** path (left side of `-v`), not `/app/data` unless that folder exists on the host
 - `GITHUB_TOKEN=` (if `origin` is private HTTPS)
 
-Manual update: `./update.sh` or `./update.sh wip`.
+Manual update: `./update.sh` or `./update.sh master` from the repo on the host.
 
 ## What gets collected
 The bot can see all group messages when privacy mode is off (needed for `/distort`). Only chat IDs and media types are stored for stats — not message text.

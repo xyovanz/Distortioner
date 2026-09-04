@@ -7,15 +7,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
-BRANCH="${1:-${UPDATE_BRANCH:-${DISTORTIONER_UPDATE_BRANCH:-master}}}"
+ENV_FILE="${DISTORTIONER_ENV_FILE:-distortioner.env}"
 LOG_DIR="${ROOT}/data"
-LOG_FILE="${DISTORTIONER_UPDATE_LOG:-${LOG_DIR}/update.log}"
 mkdir -p "${LOG_DIR}"
 
+# Load env BEFORE reading DISTORTIONER_* into locals (bug: early DATA_DIR= stayed empty).
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${ENV_FILE}"
+  set +a
+fi
+
+BRANCH="${1:-${UPDATE_BRANCH:-${DISTORTIONER_UPDATE_BRANCH:-master}}}"
+LOG_FILE="${DISTORTIONER_UPDATE_LOG:-${LOG_DIR}/update.log}"
 IMAGE="${DISTORTIONER_IMAGE:-distortioner:local}"
 CONTAINER="${DISTORTIONER_CONTAINER_NAME:-distortioner}"
 ENV_FILE="${DISTORTIONER_ENV_FILE:-distortioner.env}"
+# Docker *host* path for -v HOST:/app/data (only use /app/data if that path exists on the host).
 DATA_DIR="${DISTORTIONER_DATA_DIR:-}"
+DATA_DIR="${DATA_DIR//$'\r'/}"
+DATA_DIR="$(echo -n "${DATA_DIR}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
 notify() {
   local text="$1"
@@ -86,19 +104,6 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "======== $(date -Is) update start (branch=${BRANCH}) ========"
 echo "📂 ${ROOT}"
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "${ENV_FILE}"
-  set +a
-fi
-
 echo "📥 Fetching origin/${BRANCH}..."
 git_fetch_branch "${BRANCH}"
 
@@ -152,7 +157,7 @@ if ! docker build -t "${IMAGE}" .; then
 fi
 
 if [[ -z "${DATA_DIR}" ]]; then
-  fail "DISTORTIONER_DATA_DIR is not set (host path for -v …:/app/data)"
+  fail "DISTORTIONER_DATA_DIR is not set. Put the *host* path in distortioner.env (the left side of -v HOST:/app/data)."
 fi
 if [[ ! -f "${ENV_FILE}" ]]; then
   fail "env file ${ENV_FILE} not found"
@@ -161,9 +166,11 @@ fi
 echo "🔄 Recreating container ${CONTAINER}..."
 docker stop "${CONTAINER}" >/dev/null 2>&1 || true
 docker rm "${CONTAINER}" >/dev/null 2>&1 || true
+# Mount the git checkout at the same host path and set workdir there so /update finds update.sh.
 docker run -d --restart unless-stopped \
   --name "${CONTAINER}" \
   --env-file "${ENV_FILE}" \
+  -e "DISTORTIONER_UPDATE_SCRIPT=${ROOT}/update.sh" \
   -v "${DATA_DIR}:/app/data" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "${ROOT}:${ROOT}" \
