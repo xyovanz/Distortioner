@@ -55,15 +55,30 @@ fail() {
   exit 1
 }
 
+ensure_git_origin() {
+  if ! command -v git >/dev/null 2>&1; then
+    fail "git is not installed here (needed for /update). Rebuild the image or run ./update.sh on the host."
+  fi
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    fail "${ROOT} is not a git checkout (is .git mounted?). Mount the full repo, e.g. -v /root/Distortioner:/root/Distortioner"
+  fi
+  if git remote get-url origin >/dev/null 2>&1; then
+    return 0
+  fi
+  local url="${DISTORTIONER_GIT_REMOTE:-https://github.com/xyovanz/Distortioner.git}"
+  echo "⚠️ origin missing — adding ${url}"
+  if ! git remote add origin "${url}"; then
+    fail "could not add git remote origin (${url})"
+  fi
+}
+
 git_fetch_branch() {
   local branch="$1"
   local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
   local remote_url
-  remote_url="$(git remote get-url origin 2>/dev/null || true)"
 
-  if [[ -z "${remote_url}" ]]; then
-    fail "git remote 'origin' is not configured"
-  fi
+  ensure_git_origin
+  remote_url="$(git remote get-url origin)"
 
   echo "📡 Remote: ${remote_url}"
   if [[ -n "${token}" ]]; then
@@ -152,6 +167,9 @@ for f in .env "${ENV_FILE}"; do
 done
 
 echo "🐳 Building ${IMAGE}..."
+if ! command -v docker >/dev/null 2>&1; then
+  fail "docker CLI is not installed here (needed for /update). Rebuild the image or run ./update.sh on the host."
+fi
 if ! docker build -t "${IMAGE}" .; then
   fail "docker build failed"
 fi
