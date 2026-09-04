@@ -177,8 +177,9 @@ func (d DistorterBot) SendMessageWithRepeater(c tb.Context, toSend interface{}) 
 func (d DistorterBot) ApplyShutdownMiddleware(h tb.HandlerFunc) tb.HandlerFunc {
 	return func(c tb.Context) error {
 		d.graceWg.Add(1)
-		err := h(c)
-		d.graceWg.Done()
-		return err
+		// Must defer: telebot's Recover middleware swallows panics, so without
+		// this a panic permanently leaks the wait group and hangs graceful shutdown.
+		defer d.graceWg.Done()
+		return h(c)
 	}
 }

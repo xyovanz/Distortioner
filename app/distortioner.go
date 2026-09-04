@@ -267,6 +267,9 @@ func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
 
 func (d DistorterBot) handleReplyDistortion(c tb.Context) error {
 	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
 	if m.ReplyTo == nil {
 		msg := "You need to reply with this command to the media you want distorted."
 		if m.FromGroup() {
