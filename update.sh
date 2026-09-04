@@ -7,7 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
-BRANCH="${1:-${UPDATE_BRANCH:-${DISTORTIONER_UPDATE_BRANCH:-wip}}}"
+BRANCH="${1:-${UPDATE_BRANCH:-${DISTORTIONER_UPDATE_BRANCH:-master}}}"
 LOG_DIR="${ROOT}/data"
 LOG_FILE="${DISTORTIONER_UPDATE_LOG:-${LOG_DIR}/update.log}"
 mkdir -p "${LOG_DIR}"
