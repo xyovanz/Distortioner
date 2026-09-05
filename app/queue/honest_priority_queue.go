@@ -183,7 +183,8 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 	}
 
 	if priority > 2 {
-		hjq.users[userID]--
+		// Do not touch users[userID]: we never incremented for this rejected push.
+		// Decrementing here lets a user grow past the limit (reject → count drops → next push succeeds).
 		return 0, errors.New("You're distorting videos too often, wait until the previous ones have been processed")
 	}
 
