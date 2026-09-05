@@ -98,3 +98,28 @@ func TestHonestJobQueue_Position(t *testing.T) {
 	assert.Equal(t, 2, hjq.Position(2))
 	assert.Equal(t, 3, hjq.Position(3))
 }
+
+// Rejected pushes must not mutate the per-user job count. A leftover decrement
+// from an older increment-then-check pattern let users grow past the 3-job cap.
+func TestHonestJobQueue_RejectDoesNotBypassLimit(t *testing.T) {
+	hjq := NewHonestJobQueue(50, []int64{})
+	for i := 0; i < 3; i++ {
+		_, err := hjq.Push(1, func() {})
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, 3, hjq.Len())
+
+	for i := 0; i < 5; i++ {
+		_, err := hjq.Push(1, func() {})
+		assert.Error(t, err)
+	}
+	assert.Equal(t, 3, hjq.Len())
+
+	// After one job completes, exactly one new push should be allowed.
+	assert.Equal(t, int64(1), hjq.Pop().userID)
+	_, err := hjq.Push(1, func() {})
+	assert.NoError(t, err)
+	_, err = hjq.Push(1, func() {})
+	assert.Error(t, err)
+	assert.Equal(t, 3, hjq.Len())
+}
