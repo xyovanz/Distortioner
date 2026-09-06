@@ -111,6 +111,9 @@ func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo in
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
 		if framesDistorted == -1 {
+			// Frame workers each send exactly once; drain the rest so they cannot
+			// block forever on a full doneChan after we abandon this video.
+			drainFrameSignals(doneChan, distortedFrames+1, totalFrames)
 			progressChan <- FailedDistortImage
 			return
 		}
@@ -201,6 +204,22 @@ func collectFramesToVideoSticker(numberedFileName, frameRateFraction, filename s
 		filename)
 }
 
+// drainFrameSignals reads remaining per-frame completions so workers do not block
+// after the consumer gives up. received is how many frame signals were already taken
+// (including a failure -1). total < 0 means the producer never started workers.
+func drainFrameSignals(doneChan <-chan int, received, total int) {
+	if total < 0 {
+		return
+	}
+	for received < total {
+		<-doneChan
+		received++
+	}
+}
+
+// distortFrame is the per-frame image distort hook (overridable in tests).
+var distortFrame = DistortImage
+
 func poolDistortImages(frameDir string, doneChan chan int, intensity, rampFrom, rampTo int) {
 	cpuCount := runtime.NumCPU()
 	sem := make(chan bool, cpuCount)
@@ -218,15 +237,15 @@ func poolDistortImages(frameDir string, doneChan chan int, intensity, rampFrom, 
 	for i, frame := range frames {
 		sem <- true
 		go func(i int, frame string) {
-			defer func() {
-				<-sem
-				doneChan <- 1
-			}()
+			defer func() { <-sem }()
 			frameIntensity := FrameIntensity(intensity, rampFrom, rampTo, i, total)
-			err := DistortImage(fmt.Sprintf("%s/%s", frameDir, frame), frameIntensity)
+			err := distortFrame(fmt.Sprintf("%s/%s", frameDir, frame), frameIntensity)
 			if err != nil {
+				// Exactly one completion signal per frame (failure).
 				doneChan <- -1
+				return
 			}
+			doneChan <- 1
 		}(i, frame.Name())
 	}
 }
