@@ -37,6 +37,7 @@ func DistortVideoSticker(filename, output string, intensity, rampFrom, rampTo in
 	for totalFrames := <-doneChan; distortedFrames != totalFrames; {
 		framesDistorted := <-doneChan
 		if framesDistorted == -1 {
+			drainFrameSignals(doneChan, distortedFrames+1, totalFrames)
 			return errors.New(FailedDistortImage)
 		}
 		distortedFrames += framesDistorted
