@@ -11,10 +11,13 @@ type VideoWorker struct {
 }
 
 func NewVideoWorker(workerCount int, priorityChats []int64) *VideoWorker {
-	capacity := 300
+	// Heap backing store hint; grows as needed up to MaxQueueLen.
+	initialCap := 300
+	// Must fit every successfully Push'd job: Push allows Len() == MaxQueueLen+1.
+	messengerCap := queue.MaxQueueLen + 1
 	worker := VideoWorker{
-		queue:       queue.NewHonestJobQueue(capacity, priorityChats),
-		messenger:   make(chan interface{}, capacity),
+		queue:       queue.NewHonestJobQueue(initialCap, priorityChats),
+		messenger:   make(chan interface{}, messengerCap),
 		workerCount: workerCount,
 	}
 	for i := 0; i < workerCount; i++ {

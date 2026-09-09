@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// MaxQueueLen is the maximum number of jobs that may sit in the queue.
+// Push rejects when Len() > MaxQueueLen, so the queue can hold MaxQueueLen+1 jobs.
+// VideoWorker.messenger must be buffered to at least MaxQueueLen+1 or Submit blocks
+// the Telegram update loop once the channel fills while workers are busy.
+const MaxQueueLen = 2000
+
 // HonestJobQueue It ain't much, but it's an honest job.jpg
 // Wraps PriorityQueue to make it thread-safe. Manages priorities.
 // Extremely inefficient, but works for my use-case (very slow jobs and small queue sizes)
@@ -173,7 +179,7 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 		return 0, errors.New("The server is on temporary maintenance, no new videos are being processed at the moment, try again later")
 	}
 
-	if hjq.queue.Len() > 2000 {
+	if hjq.queue.Len() > MaxQueueLen {
 		return 0, errors.New("There are too many items queued already, try again later")
 	}
 	priority := hjq.users[userID]
