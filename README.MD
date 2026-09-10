@@ -56,7 +56,9 @@ sudo docker run -d --restart unless-stopped \
 ```
 
 ### `/update` from inside Docker
-The bot must see the git checkout, Docker CLI, and the daemon socket. **First time**, run `./update.sh` on the **host** from the repo (so mounts get set up), or recreate manually:
+The bot must see the git checkout, Docker CLI, and the daemon socket. **First time**, run `./update.sh` on the **host** from the repo (so mounts get set up), or recreate manually.
+
+`/update` cannot `docker stop` its own container (the daemon waits for the script, then SIGKILL leaves the box stopped). After building the image it starts a short-lived `distortioner-updater` helper to recreate.
 
 ```Bash
 REPO=/path/to/Distortioner   # host path to this git checkout
@@ -69,7 +71,7 @@ sudo docker run -d --restart unless-stopped \
    -v "$DATA:/app/data" \
    -v /var/run/docker.sock:/var/run/docker.sock \
    -v "$REPO:$REPO" \
-   -w "$REPO" \
+   -w /app \
    distortioner:local
 ```
 
