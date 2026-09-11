@@ -182,13 +182,14 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 	if hjq.queue.Len() > MaxQueueLen {
 		return 0, errors.New("There are too many items queued already, try again later")
 	}
-	priority := hjq.users[userID]
-	_, ok := hjq.priorityChats[userID]
-	if ok {
-		priority = -2
-	}
 
-	if priority > 2 {
+	// users[id] is the queued job count. Job heap priority is derived separately so
+	// priority chats can keep a boosted sort key without corrupting that count.
+	// (Previously priority chats wrote users[id]=-1, so BanUser/dropBannedJob treated
+	// the first skipped job as "all done" and lifted the ban — remaining jobs ran.)
+	count := hjq.users[userID]
+	_, isPriority := hjq.priorityChats[userID]
+	if !isPriority && count > 2 {
 		// Do not touch users[userID]: we never incremented for this rejected push.
 		// Decrementing here lets a user grow past the limit (reject → count drops → next push succeeds).
 		return 0, errors.New("You're distorting videos too often, wait until the previous ones have been processed")
@@ -199,10 +200,15 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 		delete(hjq.banned, userID)
 	}
 
-	hjq.users[userID] = priority + 1
+	hjq.users[userID] = count + 1
+
+	jobPriority := count
+	if isPriority {
+		jobPriority = -2
+	}
 
 	hjq.seq++
-	heap.Push(&hjq.queue, newJob(userID, priority, hjq.seq, runnable))
+	heap.Push(&hjq.queue, newJob(userID, jobPriority, hjq.seq, runnable))
 
 	return hjq.positionLocked(userID), nil
 }

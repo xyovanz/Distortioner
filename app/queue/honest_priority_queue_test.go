@@ -99,6 +99,42 @@ func TestHonestJobQueue_Position(t *testing.T) {
 	assert.Equal(t, 3, hjq.Position(3))
 }
 
+// Priority chats used to store users[id]=-1 (boosted priority written back into the
+// count). dropBannedJob then saw <=0 after one skip and lifted the ban, so the rest
+// of that user's queued jobs still ran.
+func TestHonestJobQueue_BanDropsAllPriorityChatJobs(t *testing.T) {
+	hjq := NewHonestJobQueue(50, []int64{42})
+	for i := 0; i < 3; i++ {
+		_, err := hjq.Push(42, func() {})
+		assert.NoError(t, err)
+	}
+	hjq.BanUser(42)
+
+	assert.Nil(t, hjq.Pop())
+	assert.Equal(t, 0, hjq.Len())
+
+	_, users := hjq.Stats()
+	assert.Equal(t, 0, users)
+}
+
+func TestHonestJobQueue_PriorityChatTracksUserCount(t *testing.T) {
+	hjq := NewHonestJobQueue(50, []int64{42})
+	for i := 0; i < 5; i++ {
+		_, err := hjq.Push(42, func() {})
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, 5, hjq.Len())
+	_, users := hjq.Stats()
+	assert.Equal(t, 1, users)
+
+	for i := 0; i < 5; i++ {
+		assert.NotNil(t, hjq.Pop())
+	}
+	assert.Equal(t, 0, hjq.Len())
+	_, users = hjq.Stats()
+	assert.Equal(t, 0, users)
+}
+
 // Rejected pushes must not mutate the per-user job count. A leftover decrement
 // from an older increment-then-check pattern let users grow past the 3-job cap.
 func TestHonestJobQueue_RejectDoesNotBypassLimit(t *testing.T) {
