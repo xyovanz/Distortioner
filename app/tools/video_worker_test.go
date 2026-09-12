@@ -19,7 +19,7 @@ func TestSubmitDoesNotBlockBeforeQueueLimit(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		for i := 0; i < target; i++ {
-			if _, err := vw.Submit(1, func() {}); err != nil {
+			if _, err := vw.Submit(1, 1, func() {}); err != nil {
 				done <- err
 				return
 			}
@@ -49,7 +49,7 @@ func TestSubmitRejectsAtQueueLimitWithoutHanging(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		for {
-			_, err := vw.Submit(1, func() {})
+			_, err := vw.Submit(1, 1, func() {})
 			if err != nil {
 				done <- err
 				return
