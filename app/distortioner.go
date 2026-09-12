@@ -69,13 +69,16 @@ func failStatus(err error, progress *tb.Message) string {
 // submitVideoJob gates size/rate-limit, enqueues work, and tells the user their queue position when busy.
 func (d DistorterBot) submitVideoJob(c tb.Context, fileSize int64, work func()) error {
 	m := c.Message()
+	if m == nil || m.Sender == nil || m.Chat == nil {
+		return nil
+	}
 	if fileSize > MaxSizeMb {
 		return d.SendMessageWithRepeater(c, distorters.TooBig)
 	}
 	if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
 		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
 	}
-	pos, err := d.videoWorker.Submit(m.Chat.ID, work)
+	pos, err := d.videoWorker.Submit(m.Chat.ID, m.Sender.ID, work)
 	if err != nil {
 		d.SendMessageWithRepeater(c, err.Error())
 		return nil
@@ -435,7 +438,7 @@ func (d DistorterBot) handleBanCommand(c tb.Context) error {
 	if !ok {
 		return c.Reply(fmt.Sprintf("User %d is already banned.", id))
 	}
-	d.videoWorker.BanUser(id)
+	d.videoWorker.BanSender(id)
 	return c.Reply(fmt.Sprintf("User %d has been banned.", id))
 }
 
@@ -457,6 +460,7 @@ func (d DistorterBot) handleUnbanCommand(c tb.Context) error {
 	if !ok {
 		return c.Reply(fmt.Sprintf("User %d was not banned.", id))
 	}
+	d.videoWorker.UnbanUser(id)
 	return c.Reply(fmt.Sprintf("User %d has been unbanned.", id))
 }
 
@@ -534,7 +538,7 @@ func (d DistorterBot) handleBanCallback(c tb.Context) error {
 		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d already banned", id), ShowAlert: true})
 		return nil
 	}
-	d.videoWorker.BanUser(id)
+	d.videoWorker.BanSender(id)
 	if cb.Message != nil {
 		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been banned")
 	}
@@ -567,6 +571,7 @@ func (d DistorterBot) handleUnbanCallback(c tb.Context) error {
 		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d was not banned", id), ShowAlert: true})
 		return nil
 	}
+	d.videoWorker.UnbanUser(id)
 	if cb.Message != nil {
 		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been unbanned")
 	}
