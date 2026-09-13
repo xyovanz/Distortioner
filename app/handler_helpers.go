@@ -133,6 +133,21 @@ func (d DistorterBot) DoneMessageWithRepeater(b *tb.Bot, m *tb.Message, failMsg 
 	}
 }
 
+// isReplyMessageMissing reports whether err means the reply target is gone.
+// telebot v3 surfaces ErrNotFoundToReply as "telegram: reply message not found (400)";
+// an older full-API wording is kept as a fallback.
+func isReplyMessageMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, tb.ErrNotFoundToReply) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "reply message not found") ||
+		strings.Contains(s, "message to be replied not found")
+}
+
 func (d DistorterBot) SendMessage(c tb.Context, toSend interface{}, method MethodOfResponding) (*tb.Message, error) {
 	b := c.Bot()
 	message := c.Message()
@@ -146,12 +161,15 @@ func (d DistorterBot) SendMessage(c tb.Context, toSend interface{}, method Metho
 	}
 	for err != nil {
 		switch {
-		case strings.Contains(err.Error(), "not enough rights to send"):
+		case strings.Contains(err.Error(), "not enough rights to send"),
+			strings.Contains(err.Error(), "have no rights to send"):
 			b.Reply(message, NotEnoughRights)
-		case strings.Contains(err.Error(), "bot was blocked by the user (403)"):
+			return nil, err
+		case strings.Contains(err.Error(), "bot was blocked by the user"):
 			d.videoWorker.BanUser(message.Chat.ID)
 			return nil, nil
-		case strings.Contains(err.Error(), "telegram: Bad Request: message to be replied not found (400)"):
+		case isReplyMessageMissing(err):
+			// Source message deleted while we worked — deliver without reply threading.
 			return d.SendMessage(c, toSend, Send)
 		}
 
@@ -162,7 +180,13 @@ func (d DistorterBot) SendMessage(c tb.Context, toSend interface{}, method Metho
 			return nil, err
 		}
 		time.Sleep(time.Duration(timeout) * time.Second)
-		m, err = b.Reply(message, toSend)
+		// Respect the original method: after falling back to Send, 429 retries must not
+		// switch back to Reply (the reply target is still missing).
+		if method == Reply {
+			m, err = b.Reply(message, toSend)
+		} else {
+			m, err = b.Send(message.Chat, toSend)
+		}
 		if err != nil {
 			d.logger.Error(err)
 		}
