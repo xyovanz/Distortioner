@@ -269,6 +269,21 @@ func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
 	return d.SendMessageWithRepeater(c, distorted)
 }
 
+// replyMediaMessage returns a shallow copy of the replied-to media message whose
+// Sender is the /distort requester. ReplyTo from channel posts / anonymous admins
+// often has a nil Sender; handlers that load /ramp via m.Sender.ID would panic, and
+// even when Sender is set it is the media author — not the user who asked to distort.
+func replyMediaMessage(command, media *tb.Message) *tb.Message {
+	if media == nil {
+		return nil
+	}
+	cp := *media
+	if command != nil {
+		cp.Sender = command.Sender
+	}
+	return &cp
+}
+
 func (d DistorterBot) handleReplyDistortion(c tb.Context) error {
 	m := c.Message()
 	if m == nil || m.Sender == nil {
@@ -281,7 +296,7 @@ func (d DistorterBot) handleReplyDistortion(c tb.Context) error {
 		}
 		return c.Reply(msg)
 	}
-	original := m.ReplyTo
+	original := replyMediaMessage(m, m.ReplyTo)
 	update := c.Update()
 	update.Message = original
 	tweakedContext := c.Bot().NewContext(update)
@@ -820,7 +835,7 @@ func main() {
 				if !permissions.CanSendMessages {
 					logger.Warn("can't send anything at all", zap.Int64("chat_id", m.Chat.ID))
 					return false
-				} else if (!permissions.CanSendMedia && tools.IsMedia(m.ReplyTo)) || (!permissions.CanSendOther && tools.IsNonMediaMedia(m.ReplyTo)) {
+				} else if !tools.CanSendReplyMedia(permissions, m.ReplyTo) {
 					b.Reply(m, NotEnoughRights)
 					return false
 				}
