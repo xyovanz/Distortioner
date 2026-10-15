@@ -206,6 +206,7 @@ in_target_container() {
 
 write_run_container() {
   # Keep workdir /app so SQLite uses the /app/data volume. Mount the repo so /update can run update.sh.
+  # Callers must check exit status: stop/rm already ran, so a silent failure leaves the bot down.
   cat <<EOF
 docker run -d --restart unless-stopped \\
   --name $(printf '%q' "${CONTAINER}") \\
@@ -216,7 +217,7 @@ docker run -d --restart unless-stopped \\
   -v $(printf '%q' "${ROOT}"):$(printf '%q' "${ROOT}") \\
   -w /app \\
   --entrypoint /app/distortioner \\
-  $(printf '%q' "${IMAGE}") || { echo "❌ docker run failed"; exit 1; }
+  $(printf '%q' "${IMAGE}")
 EOF
 }
 
@@ -233,20 +234,27 @@ if in_target_container || in_docker; then
 set -euo pipefail
 exec >>$(printf '%q' "${LOG_FILE}") 2>&1
 echo "======== \$(date -Is) helper recreate start ========"
+TOKEN=$(printf '%q' "${DISTORTIONER_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}")
+CHAT=$(printf '%q' "${UPDATE_NOTIFY_CHAT_ID:-${DISTORTIONER_ADMIN_ID:-${TELEGRAM_ADMIN_ID:-}}}")
+helper_notify() {
+  local text="\$1"
+  if [[ -n "\${TOKEN}" && -n "\${CHAT}" ]]; then
+    curl -fsS -X POST "https://api.telegram.org/bot\${TOKEN}/sendMessage" \\
+      --data-urlencode "chat_id=\${CHAT}" \\
+      --data-urlencode "text=\${text}" \\
+      --data-urlencode "disable_web_page_preview=true" \\
+      >/dev/null 2>&1 || true
+  fi
+}
 sleep 2
 docker stop -t 20 $(printf '%q' "${CONTAINER}") >/dev/null 2>&1 || true
 docker rm -f $(printf '%q' "${CONTAINER}") >/dev/null 2>&1 || true
-$(write_run_container)
-TOKEN=$(printf '%q' "${DISTORTIONER_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}")
-CHAT=$(printf '%q' "${UPDATE_NOTIFY_CHAT_ID:-${DISTORTIONER_ADMIN_ID:-${TELEGRAM_ADMIN_ID:-}}}")
-TEXT=$(printf '%q' "✅ Distortioner updated to ${HEAD_SHA} (${HEAD_MSG}). Container recreated.")
-if [[ -n "\${TOKEN}" && -n "\${CHAT}" ]]; then
-  curl -fsS -X POST "https://api.telegram.org/bot\${TOKEN}/sendMessage" \\
-    --data-urlencode "chat_id=\${CHAT}" \\
-    --data-urlencode "text=\${TEXT}" \\
-    --data-urlencode "disable_web_page_preview=true" \\
-    >/dev/null 2>&1 || true
+if ! $(write_run_container); then
+  echo "❌ docker run failed after removing $(printf '%q' "${CONTAINER}") — bot is down"
+  helper_notify "❌ Distortioner /update failed: docker run failed after removing $(printf '%q' "${CONTAINER}") — bot is down until manually recreated. Check $(printf '%q' "${LOG_FILE}")."
+  exit 1
 fi
+helper_notify "✅ Distortioner updated to ${HEAD_SHA} (${HEAD_MSG}). Container recreated."
 echo "✅ Helper recreate complete at \$(date -Is) (${HEAD_SHA})"
 EOF
   chmod +x "${HELPER_SCRIPT}"
@@ -267,7 +275,9 @@ fi
 
 docker stop -t 20 "${CONTAINER}" >/dev/null 2>&1 || true
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-eval "$(write_run_container)"
+if ! eval "$(write_run_container)"; then
+  fail "docker run failed after removing ${CONTAINER} — bot is down until manually recreated"
+fi
 
 notify "✅ Distortioner updated to ${HEAD_SHA} (${HEAD_MSG}). Container recreated."
 
