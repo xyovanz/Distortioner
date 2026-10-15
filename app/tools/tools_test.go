@@ -1,9 +1,56 @@
 package tools
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
+
+	tb "gopkg.in/telebot.v3"
 )
+
+func TestCanSendReplyMedia_GranularVsLegacy(t *testing.T) {
+	photo := &tb.Message{Photo: &tb.Photo{}}
+	video := &tb.Message{Video: &tb.Video{}}
+	sticker := &tb.Message{Sticker: &tb.Sticker{}}
+
+	// Modern getChat payload: granular flags only (can_send_media_messages omitted → false).
+	modern := `{
+		"can_send_messages": true,
+		"can_send_photos": true,
+		"can_send_videos": true,
+		"can_send_video_notes": true,
+		"can_send_voice_notes": true,
+		"can_send_other_messages": true
+	}`
+	var modernPerms tb.Rights
+	if err := json.Unmarshal([]byte(modern), &modernPerms); err != nil {
+		t.Fatal(err)
+	}
+	if modernPerms.CanSendMedia {
+		t.Fatal("expected deprecated CanSendMedia to be false on modern JSON")
+	}
+	if !CanSendReplyMedia(&modernPerms, photo) || !CanSendReplyMedia(&modernPerms, video) {
+		t.Fatal("modern granular allow must permit photo/video")
+	}
+
+	// Legacy payload: only can_send_media_messages.
+	legacy := `{"can_send_messages": true, "can_send_media_messages": true, "can_send_other_messages": true}`
+	var legacyPerms tb.Rights
+	if err := json.Unmarshal([]byte(legacy), &legacyPerms); err != nil {
+		t.Fatal(err)
+	}
+	if !CanSendReplyMedia(&legacyPerms, photo) {
+		t.Fatal("legacy CanSendMedia must still permit photo")
+	}
+
+	denied := &tb.Rights{CanSendMessages: true}
+	if CanSendReplyMedia(denied, photo) || CanSendReplyMedia(denied, sticker) {
+		t.Fatal("denied media/other permissions must reject")
+	}
+	if !CanSendReplyMedia(denied, &tb.Message{Text: "hi"}) {
+		t.Fatal("text replies do not need media send rights")
+	}
+}
 
 func TestExtractPossibleTimeout(t *testing.T) {
 	err := errors.New("telegram: retry after 5 (429)")

@@ -32,6 +32,35 @@ func IsNonMediaMedia(m *tb.Message) bool {
 	return m.Animation != nil || m.Sticker != nil
 }
 
+// CanSendReplyMedia reports whether default chat permissions allow sending a reply
+// matching the replied-to media type.
+//
+// Telegram replaced can_send_media_messages with granular fields (can_send_photos,
+// etc.). Libraries still unmarshal the deprecated field when present, but modern
+// getChat payloads often omit it (false zero-value) while setting the granular
+// flags — so checking only CanSendMedia falsely rejects /distort in groups.
+// Prefer granular flags; fall back to CanSendMedia for legacy payloads.
+func CanSendReplyMedia(perms *tb.Rights, reply *tb.Message) bool {
+	if perms == nil || reply == nil {
+		return true
+	}
+	legacy := perms.CanSendMedia
+	switch {
+	case reply.Photo != nil:
+		return perms.CanSendPhotos || legacy
+	case reply.Video != nil:
+		return perms.CanSendVideos || legacy
+	case reply.VideoNote != nil:
+		return perms.CanSendVideoNotes || legacy
+	case reply.Voice != nil:
+		return perms.CanSendVoiceNotes || legacy
+	case reply.Animation != nil || reply.Sticker != nil:
+		return perms.CanSendOther
+	default:
+		return true
+	}
+}
+
 // IsBotCommand reports whether the message is a Telegram bot command (should not be text-distorted).
 func IsBotCommand(m *tb.Message) bool {
 	if m == nil {
