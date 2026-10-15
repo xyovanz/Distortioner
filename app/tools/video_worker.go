@@ -26,8 +26,19 @@ func NewVideoWorker(workerCount int, priorityChats []int64) *VideoWorker {
 	return &worker
 }
 
-func (vw *VideoWorker) BanUser(userID int64) {
-	vw.queue.BanUser(userID)
+// BanUser soft-bans a chat (bot blocked the bot / chat blocked us).
+func (vw *VideoWorker) BanUser(chatID int64) {
+	vw.queue.BanUser(chatID)
+}
+
+// BanSender sticky-bans a Telegram user (admin /ban). Drops their queued jobs across chats.
+func (vw *VideoWorker) BanSender(senderID int64) {
+	vw.queue.BanSender(senderID)
+}
+
+// UnbanUser clears a sticky admin ban.
+func (vw *VideoWorker) UnbanUser(senderID int64) {
+	vw.queue.UnbanUser(senderID)
 }
 
 func (vw *VideoWorker) run() {
@@ -39,8 +50,8 @@ func (vw *VideoWorker) run() {
 	}
 }
 
-func (vw *VideoWorker) Submit(userID int64, runnable func()) (int, error) {
-	pos, err := vw.queue.Push(userID, runnable)
+func (vw *VideoWorker) Submit(chatID, senderID int64, runnable func()) (int, error) {
+	pos, err := vw.queue.Push(chatID, senderID, runnable)
 	if err != nil {
 		return 0, err
 	}

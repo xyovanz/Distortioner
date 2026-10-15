@@ -2,9 +2,10 @@ package queue
 
 import (
 	"container/heap"
-	"github.com/pkg/errors"
 	"sync"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 // MaxQueueLen is the maximum number of jobs that may sit in the queue.
@@ -19,8 +20,9 @@ const MaxQueueLen = 2000
 type HonestJobQueue struct {
 	mu            *sync.RWMutex
 	queue         PriorityQueue
-	users         map[int64]int // Tracks the amount of job per-user currently in the queue. Used to calculate priority
-	banned        map[int64]any // Drop jobs from these users
+	users         map[int64]int // Tracks the amount of jobs per chat currently in the queue. Used to calculate priority
+	softBanned    map[int64]any // Drop jobs for these chat IDs (bot was blocked); cleared on Push / when drained
+	adminBanned   map[int64]any // Sticky sender bans from admin /ban; only UnbanUser clears
 	maintenance   bool
 	priorityChats map[int64]any // not very honest of an honest job queue, but I don't care, I'm not waiting with everybody else
 	seq           int64         // stable tie-break when insertion times collide
@@ -35,19 +37,36 @@ func NewHonestJobQueue(initialCapacity int, priorityChats []int64) *HonestJobQue
 		mu:            &sync.RWMutex{},
 		queue:         make(PriorityQueue, 0, initialCapacity),
 		users:         make(map[int64]int),
-		banned:        make(map[int64]any),
+		softBanned:    make(map[int64]any),
+		adminBanned:   make(map[int64]any),
 		priorityChats: priorityChatsMap,
 	}
 }
 
-// BanUser This will "ban" the user (if they were impatient and banned the bot first)
-// causing their jobs to be dropped when they pop up. Once all the jobs have been popped
-// the ban will be lifted
-func (hjq *HonestJobQueue) BanUser(userID int64) {
+// BanUser soft-bans a chat (bot was blocked). Remaining jobs for that chat are
+// dropped on Pop. Lifted after those jobs are skipped, or when the chat Push'es again.
+func (hjq *HonestJobQueue) BanUser(chatID int64) {
 	hjq.mu.Lock()
 	defer hjq.mu.Unlock()
 
-	hjq.banned[userID] = nil
+	hjq.softBanned[chatID] = nil
+}
+
+// BanSender sticky-bans a Telegram user so their queued jobs are dropped until UnbanUser.
+// Matches Job.senderID (not chat ID), so group-queued work is cancelled correctly.
+func (hjq *HonestJobQueue) BanSender(senderID int64) {
+	hjq.mu.Lock()
+	defer hjq.mu.Unlock()
+
+	hjq.adminBanned[senderID] = nil
+}
+
+// UnbanUser clears a sticky admin ban.
+func (hjq *HonestJobQueue) UnbanUser(senderID int64) {
+	hjq.mu.Lock()
+	defer hjq.mu.Unlock()
+
+	delete(hjq.adminBanned, senderID)
 }
 
 func (hjq *HonestJobQueue) updatePriorities(userID int64) {
@@ -79,7 +98,7 @@ func (hjq *HonestJobQueue) Stats() (int, int) {
 	return len(hjq.queue), len(hjq.users)
 }
 
-// Position returns 1-based queue position for the user's earliest job, or 0 if none.
+// Position returns 1-based queue position for the chat's earliest job, or 0 if none.
 func (hjq *HonestJobQueue) Position(userID int64) int {
 	hjq.mu.RLock()
 	defer hjq.mu.RUnlock()
@@ -127,12 +146,18 @@ func (hjq *HonestJobQueue) Maintenance() bool {
 	return hjq.maintenance
 }
 
-func (hjq *HonestJobQueue) dropBannedJob(userID int64) {
-	hjq.users[userID]--
-	if hjq.users[userID] <= 0 {
-		delete(hjq.users, userID)
-		// All of this user's queued jobs are gone; lift the ban.
-		delete(hjq.banned, userID)
+func (hjq *HonestJobQueue) dropJobCount(chatID int64) {
+	hjq.users[chatID]--
+	if hjq.users[chatID] <= 0 {
+		delete(hjq.users, chatID)
+	}
+}
+
+func (hjq *HonestJobQueue) dropSoftBannedJob(chatID int64) {
+	hjq.dropJobCount(chatID)
+	if _, stillHasJobs := hjq.users[chatID]; !stillHasJobs {
+		// All of this chat's queued jobs are gone; lift the soft ban.
+		delete(hjq.softBanned, chatID)
 	}
 }
 
@@ -146,9 +171,15 @@ func (hjq *HonestJobQueue) Pop() *Job {
 		}
 		job := heap.Pop(&hjq.queue).(*Job)
 
-		if _, banned := hjq.banned[job.userID]; banned {
-			// Skip this job only; do not drain unrelated users' work.
-			hjq.dropBannedJob(job.userID)
+		_, soft := hjq.softBanned[job.userID]
+		_, admin := hjq.adminBanned[job.senderID]
+		if soft || admin {
+			// Skip this job only; do not drain unrelated chats' work.
+			if soft {
+				hjq.dropSoftBannedJob(job.userID)
+			} else {
+				hjq.dropJobCount(job.userID)
+			}
 			continue
 		}
 
@@ -171,7 +202,8 @@ func (hjq *HonestJobQueue) ToggleMaintenance() bool {
 	return hjq.maintenance
 }
 
-func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
+// Push enqueues work for chatID (fairness key). senderID is who triggered it (admin bans).
+func (hjq *HonestJobQueue) Push(chatID, senderID int64, runnable func()) (int, error) {
 	hjq.mu.Lock()
 	defer hjq.mu.Unlock()
 
@@ -183,24 +215,28 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 		return 0, errors.New("There are too many items queued already, try again later")
 	}
 
+	if _, banned := hjq.adminBanned[senderID]; banned {
+		return 0, errors.New("You are banned from using this bot")
+	}
+
 	// users[id] is the queued job count. Job heap priority is derived separately so
 	// priority chats can keep a boosted sort key without corrupting that count.
 	// (Previously priority chats wrote users[id]=-1, so BanUser/dropBannedJob treated
 	// the first skipped job as "all done" and lifted the ban — remaining jobs ran.)
-	count := hjq.users[userID]
-	_, isPriority := hjq.priorityChats[userID]
+	count := hjq.users[chatID]
+	_, isPriority := hjq.priorityChats[chatID]
 	if !isPriority && count > 2 {
-		// Do not touch users[userID]: we never incremented for this rejected push.
+		// Do not touch users[chatID]: we never incremented for this rejected push.
 		// Decrementing here lets a user grow past the limit (reject → count drops → next push succeeds).
 		return 0, errors.New("You're distorting videos too often, wait until the previous ones have been processed")
 	}
 
-	// if a user sent us a message then we're clearly unbanned
-	if _, ok := hjq.banned[userID]; ok {
-		delete(hjq.banned, userID)
-	}
+	// Soft ban only: if this chat messaged us again, the bot is no longer blocked.
+	// Admin bans must stay until UnbanUser — clearing them here let in-flight
+	// Submit races undo /ban while queued jobs were still waiting.
+	delete(hjq.softBanned, chatID)
 
-	hjq.users[userID] = count + 1
+	hjq.users[chatID] = count + 1
 
 	jobPriority := count
 	if isPriority {
@@ -208,7 +244,7 @@ func (hjq *HonestJobQueue) Push(userID int64, runnable func()) (int, error) {
 	}
 
 	hjq.seq++
-	heap.Push(&hjq.queue, newJob(userID, jobPriority, hjq.seq, runnable))
+	heap.Push(&hjq.queue, newJob(chatID, senderID, jobPriority, hjq.seq, runnable))
 
-	return hjq.positionLocked(userID), nil
+	return hjq.positionLocked(chatID), nil
 }
