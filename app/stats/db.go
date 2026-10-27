@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -18,6 +20,10 @@ type DistortionerDB struct {
 	db     *sql.DB
 	insert *sql.Stmt
 	logger *zap.SugaredLogger
+
+	// In-memory mirror of banned_users (user_id → reason) so the per-update ban check skips SQLite.
+	bansMu sync.RWMutex
+	bans   map[int64]string
 }
 
 type Stat struct {
@@ -31,6 +37,8 @@ type Stat struct {
 	Voice        int
 	Photo        int
 	Text         int
+	Users        int // distinct senders (only rows recorded since sender_id was added)
+	NewUsers     int // users first seen in the period
 }
 
 type Period string
@@ -52,17 +60,22 @@ const statQuery = `
 		   count(case when type = 'videonote' then type end) as videonote,
 		   count(case when type = 'voice' then type end) as voice,
 		   count(case when type = 'photo' then type end) as photo,
-		   count(case when type = 'text' then type end) as text
+		   count(case when type = 'text' then type end) as text,
+		   count(distinct(sender_id)) as senders
 	from stats
-	where date >= datetime('now', ?, 'localtime') and datetime('now','localtime');
+	where date >= datetime('now', ?, 'localtime');
 `
 
 func InitDB(logger *zap.SugaredLogger) *DistortionerDB {
-	err := os.Mkdir("data", os.ModePerm)
-	if err != nil && !os.IsExist(err) {
+	return openDB(logger, filepath.Join("data", "distortioner.sqlite"))
+}
+
+func openDB(logger *zap.SugaredLogger, path string) *DistortionerDB {
+	err := os.MkdirAll(filepath.Dir(path), os.ModePerm)
+	if err != nil {
 		logger.Fatal("Failed to create data directory for stat DB", err)
 	}
-	db, err := sql.Open("sqlite3", "file:data/distortioner.sqlite?cache=shared")
+	db, err := sql.Open("sqlite3", "file:"+filepath.ToSlash(path)+"?cache=shared&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -80,7 +93,16 @@ func InitDB(logger *zap.SugaredLogger) *DistortionerDB {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	insertStat, err := db.Prepare(`insert into stats(user_id, is_group_chat, date, type) values(?, ?, ?, ?);`)
+	// sender_id is the Telegram user behind the request; user_id has always held the chat ID.
+	_, err = db.Exec(`alter table stats add column sender_id integer`)
+	if err != nil && !isSQLiteDuplicateColumn(err) {
+		logger.Fatal(err)
+	}
+	_, err = db.Exec(`create index if not exists sender_date_idx on stats(sender_id, date)`)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	insertStat, err := db.Prepare(`insert into stats(user_id, sender_id, is_group_chat, date, type) values(?, ?, ?, ?, ?);`)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -112,6 +134,12 @@ func InitDB(logger *zap.SugaredLogger) *DistortionerDB {
 	}
 	_, err = db.Exec(`create table if not exists banned_users(user_id integer not null primary key, banned_at text not null)`)
 	if err != nil {
+		logger.Fatal(err)
+	}
+	if err = dist.migrateUsers(); err != nil {
+		logger.Fatal(err)
+	}
+	if err = dist.loadBans(); err != nil {
 		logger.Fatal(err)
 	}
 
@@ -273,58 +301,18 @@ func (d *DistortionerDB) ToggleUserRamp(userID int64) (from, to int, enabled boo
 	return from, to, true, err
 }
 
-func (d *DistortionerDB) IsBanned(userID int64) bool {
-	var id int64
-	err := d.db.QueryRow(`select user_id from banned_users where user_id = ?`, userID).Scan(&id)
-	return err == nil
-}
-
-// BanUser persists a ban. Returns true if newly banned.
-func (d *DistortionerDB) BanUser(userID int64) (bool, error) {
-	if d.IsBanned(userID) {
-		return false, nil
-	}
-	_, err := d.db.Exec(`insert into banned_users(user_id, banned_at) values(?, ?)`, userID, time.Now().UTC().Format(time.RFC3339))
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// UnbanUser removes a ban. Returns true if the user was banned.
-func (d *DistortionerDB) UnbanUser(userID int64) (bool, error) {
-	res, err := d.db.Exec(`delete from banned_users where user_id = ?`, userID)
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-func (d *DistortionerDB) BannedUsers() ([]int64, error) {
-	rows, err := d.db.Query(`select user_id from banned_users order by banned_at desc`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
+// SaveStat records one distortion request. For a /distort reply the media type comes from the
+// replied-to message, but the sender is whoever issued the command.
 func (d *DistortionerDB) SaveStat(message *tb.Message, isCommand bool) {
 	if message == nil {
 		return
 	}
+	sender := message.Sender
 	if isCommand {
-		d.SaveStat(message.ReplyTo, false)
-		return
+		message = message.ReplyTo
+		if message == nil {
+			return
+		}
 	}
 	messageType := "text"
 	switch {
@@ -341,7 +329,11 @@ func (d *DistortionerDB) SaveStat(message *tb.Message, isCommand bool) {
 	case message.Photo != nil:
 		messageType = "photo"
 	}
-	_, err := d.insert.Exec(message.Chat.ID, message.FromGroup(), time.Now(), messageType)
+	var senderID any
+	if sender != nil {
+		senderID = sender.ID
+	}
+	_, err := d.insert.Exec(message.Chat.ID, senderID, message.FromGroup(), time.Now(), messageType)
 	if err != nil {
 		d.logger.Error(err)
 	}
@@ -351,7 +343,11 @@ func (d *DistortionerDB) GetStat(period Period) (Stat, error) {
 	row := d.db.QueryRow(statQuery, period)
 	var stat Stat
 	err := row.Scan(&stat.Interactions, &stat.Chats, &stat.Groups, &stat.Sticker, &stat.Animation, &stat.Video,
-		&stat.VideoNote, &stat.Voice, &stat.Photo, &stat.Text)
+		&stat.VideoNote, &stat.Voice, &stat.Photo, &stat.Text, &stat.Users)
+	if err != nil {
+		return stat, err
+	}
+	stat.NewUsers, err = d.NewUsers(period)
 	return stat, err
 }
 

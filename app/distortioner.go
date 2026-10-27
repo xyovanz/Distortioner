@@ -39,6 +39,9 @@ type DistorterBot struct {
 	codec       string
 	db          *stats.DistortionerDB
 	startedAt   time.Time
+
+	bannedNotice  *tools.Throttle // "you are banned" replies, once per hour per user
+	unbanRequests *tools.Throttle // /unbanrequest, once per day per user
 }
 
 func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFunc {
@@ -425,9 +428,7 @@ func (d DistorterBot) handleStart(c tb.Context) error {
 		fullName = "Unknown"
 	}
 	adminText := fmt.Sprintf("АЛЯРМ! До бота доебался\n\nID: %d\nИмя: %s\nUsername: %s", m.Sender.ID, fullName, username)
-	markup := &tb.ReplyMarkup{}
-	btn := markup.Data("🚫 Ban User", "ban", strconv.FormatInt(m.Sender.ID, 10))
-	markup.Inline(markup.Row(btn))
+	markup := userAdminMarkup(m.Sender.ID, d.db.IsBanned(m.Sender.ID))
 	if _, err := c.Bot().Send(&tb.User{ID: d.adminID}, adminText, markup); err != nil {
 		d.logger.Errorw("admin start alert failed", "err", err)
 	}
@@ -435,165 +436,6 @@ func (d DistorterBot) handleStart(c tb.Context) error {
 		d.logger.Errorw("forward /start failed", "err", err)
 	}
 	return nil
-}
-
-func (d DistorterBot) handleBanCommand(c tb.Context) error {
-	m := c.Message()
-	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
-		return nil
-	}
-	payload := strings.TrimSpace(m.Payload)
-	id, err := strconv.ParseInt(payload, 10, 64)
-	if err != nil || id == 0 {
-		return c.Reply("Usage: /ban <user_id>")
-	}
-	if id == d.adminID {
-		return c.Reply("Can't ban yourself.")
-	}
-	ok, err := d.db.BanUser(id)
-	if err != nil {
-		d.logger.Error(err)
-		return c.Reply("Failed to ban.")
-	}
-	if !ok {
-		return c.Reply(fmt.Sprintf("User %d is already banned.", id))
-	}
-	d.videoWorker.BanUser(id)
-	return c.Reply(fmt.Sprintf("User %d has been banned.", id))
-}
-
-func (d DistorterBot) handleUnbanCommand(c tb.Context) error {
-	m := c.Message()
-	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
-		return nil
-	}
-	payload := strings.TrimSpace(m.Payload)
-	id, err := strconv.ParseInt(payload, 10, 64)
-	if err != nil || id == 0 {
-		return c.Reply("Usage: /unban <user_id>")
-	}
-	ok, err := d.db.UnbanUser(id)
-	if err != nil {
-		d.logger.Error(err)
-		return c.Reply("Failed to unban.")
-	}
-	if !ok {
-		return c.Reply(fmt.Sprintf("User %d was not banned.", id))
-	}
-	return c.Reply(fmt.Sprintf("User %d has been unbanned.", id))
-}
-
-func (d DistorterBot) handleBannedUsers(c tb.Context) error {
-	m := c.Message()
-	if m == nil || m.Sender == nil || m.Sender.ID != d.adminID {
-		return nil
-	}
-	ids, err := d.db.BannedUsers()
-	if err != nil {
-		d.logger.Error(err)
-		return c.Reply("Failed to list bans.")
-	}
-	if len(ids) == 0 {
-		return c.Reply("No banned users.")
-	}
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Banned users (%d):\n", len(ids)))
-	for _, id := range ids {
-		b.WriteString(fmt.Sprintf("%d\n", id))
-	}
-	return c.Reply(b.String())
-}
-
-func (d DistorterBot) handleUnbanRequest(c tb.Context) error {
-	m := c.Message()
-	if m == nil || m.Sender == nil {
-		return nil
-	}
-	if !d.db.IsBanned(m.Sender.ID) {
-		return c.Reply("You are not banned.")
-	}
-	reason := strings.TrimSpace(m.Payload)
-	username := "N/A"
-	if m.Sender.Username != "" {
-		username = "@" + m.Sender.Username
-	}
-	msg := fmt.Sprintf("Unban request\nID: %d\nUsername: %s\nReason: %s", m.Sender.ID, username, reason)
-	if reason == "" {
-		msg = fmt.Sprintf("Unban request\nID: %d\nUsername: %s\n(no reason)", m.Sender.ID, username)
-	}
-	markup := &tb.ReplyMarkup{}
-	btnUnban := markup.Data("✅ Unban", "unban", strconv.FormatInt(m.Sender.ID, 10))
-	markup.Inline(markup.Row(btnUnban))
-	if _, err := c.Bot().Send(&tb.User{ID: d.adminID}, msg, markup); err != nil {
-		d.logger.Error(err)
-		return c.Reply("Could not notify admin. Try again later.")
-	}
-	return c.Reply("Unban request sent to the admin.")
-}
-
-func (d DistorterBot) handleBanCallback(c tb.Context) error {
-	cb := c.Callback()
-	if cb == nil || cb.Sender == nil || cb.Sender.ID != d.adminID {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Unauthorized", ShowAlert: true})
-		return nil
-	}
-	args := c.Args()
-	if len(args) < 1 {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
-		return nil
-	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id == 0 {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
-		return nil
-	}
-	ok, err := d.db.BanUser(id)
-	if err != nil {
-		d.logger.Error(err)
-		_ = c.Respond(&tb.CallbackResponse{Text: "Error", ShowAlert: true})
-		return nil
-	}
-	if !ok {
-		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d already banned", id), ShowAlert: true})
-		return nil
-	}
-	d.videoWorker.BanUser(id)
-	if cb.Message != nil {
-		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been banned")
-	}
-	return c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("Banned %d", id), ShowAlert: true})
-}
-
-func (d DistorterBot) handleUnbanCallback(c tb.Context) error {
-	cb := c.Callback()
-	if cb == nil || cb.Sender == nil || cb.Sender.ID != d.adminID {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Unauthorized", ShowAlert: true})
-		return nil
-	}
-	args := c.Args()
-	if len(args) < 1 {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
-		return nil
-	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id == 0 {
-		_ = c.Respond(&tb.CallbackResponse{Text: "Invalid user ID", ShowAlert: true})
-		return nil
-	}
-	ok, err := d.db.UnbanUser(id)
-	if err != nil {
-		d.logger.Error(err)
-		_ = c.Respond(&tb.CallbackResponse{Text: "Error", ShowAlert: true})
-		return nil
-	}
-	if !ok {
-		_ = c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("User %d was not banned", id), ShowAlert: true})
-		return nil
-	}
-	if cb.Message != nil {
-		_, _ = c.Bot().Edit(cb.Message, cb.Message.Text+"\n\n✅ User has been unbanned")
-	}
-	return c.Respond(&tb.CallbackResponse{Text: fmt.Sprintf("Unbanned %d", id), ShowAlert: true})
 }
 
 func (d DistorterBot) handleStatus(c tb.Context) error {
@@ -714,8 +556,13 @@ func (d DistorterBot) handleStatRequest(c tb.Context, db *stats.DistortionerDB, 
 		d.logger.Warnf("stats asked for a weird period", zap.String("period", string(period)))
 		return nil
 	}
-	message := fmt.Sprintf("*%s*\nDistorted %d messages in %d distinct chats, %d of which were group chats\n",
-		header, stat.Interactions, stat.Chats, stat.Groups)
+	totalUsers, err := db.TotalUsers()
+	if err != nil {
+		d.logger.Error(err)
+	}
+	message := fmt.Sprintf("*%s*\nDistorted %d messages in %d distinct chats, %d of which were group chats\n"+
+		"Active users: %d, new: %d, known in total: %d\n",
+		header, stat.Interactions, stat.Chats, stat.Groups, stat.Users, stat.NewUsers, totalUsers)
 	details := fmt.Sprintf(`
 *Breakdown by type*
 _Stickers_: %d
@@ -749,12 +596,14 @@ func (d DistorterBot) handleMaintenance(c tb.Context) error {
 func skipStatCommand(text string) bool {
 	switch {
 	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update", text == "/status",
-		text == "/ban", text == "/unban", text == "/bannedusers", text == "/unbanrequest", text == "/start":
+		text == "/ban", text == "/unban", text == "/bannedusers", text == "/unbanrequest", text == "/start",
+		text == "/user", text == "/topusers":
 		return true
 	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/ramp"), strings.HasPrefix(text, "/sound"),
 		strings.HasPrefix(text, "/update@"),
 		strings.HasPrefix(text, "/ban"), strings.HasPrefix(text, "/unban"), strings.HasPrefix(text, "/bannedusers"),
-		strings.HasPrefix(text, "/unbanrequest"), strings.HasPrefix(text, "/start@"):
+		strings.HasPrefix(text, "/unbanrequest"), strings.HasPrefix(text, "/start@"),
+		strings.HasPrefix(text, "/user"), strings.HasPrefix(text, "/topusers"):
 		return true
 	case strings.HasPrefix(text, "/daily@"), strings.HasPrefix(text, "/weekly@"), strings.HasPrefix(text, "/monthly@"),
 		strings.HasPrefix(text, "/queue@"), strings.HasPrefix(text, "/maintenance@"), strings.HasPrefix(text, "/status@"):
@@ -812,6 +661,9 @@ func main() {
 		codec:       codec,
 		db:          db,
 		startedAt:   time.Now(),
+
+		bannedNotice:  tools.NewThrottle(time.Hour),
+		unbanRequests: tools.NewThrottle(24 * time.Hour),
 	}
 	b.Poller = tb.NewMiddlewarePoller(&tb.LongPoller{Timeout: 10 * time.Second}, func(update *tb.Update) bool {
 		if update.Message == nil {
@@ -827,9 +679,15 @@ func main() {
 		if time.Now().Sub(m.Time()) > 2*time.Hour {
 			return false
 		}
-		if m.Sender != nil && m.Sender.ID != adminID && db.IsBanned(m.Sender.ID) {
-			if !(strings.HasPrefix(text, "/unbanrequest")) {
-				b.Reply(m, "You are banned from using this bot.\n\nUse /unbanrequest to request an unban.")
+		if m.Sender != nil {
+			go db.TouchUser(m.Sender)
+		}
+		if m.Sender != nil && m.Sender.ID != adminID {
+			if reason, banned := db.BanReason(m.Sender.ID); banned && !strings.HasPrefix(text, "/unbanrequest") {
+				// Throttled so a banned user spamming the bot can't burn our Telegram send quota.
+				if d.bannedNotice.Allow(m.Sender.ID, time.Now()) {
+					b.Reply(m, bannedNoticeText(reason))
+				}
 				return false
 			}
 		}
@@ -873,11 +731,12 @@ func main() {
 	b.Handle("/unban", d.handleUnbanCommand)
 	b.Handle("/bannedusers", d.handleBannedUsers)
 	b.Handle("/unbanrequest", d.handleUnbanRequest)
+	b.Handle("/user", d.handleUserCommand)
+	b.Handle("/topusers", d.handleTopUsers)
 
-	banBtn := &tb.InlineButton{Unique: "ban"}
-	unbanBtn := &tb.InlineButton{Unique: "unban"}
-	b.Handle(banBtn, d.handleBanCallback)
-	b.Handle(unbanBtn, d.handleUnbanCallback)
+	b.Handle(&tb.InlineButton{Unique: "ban"}, d.handleBanCallback)
+	b.Handle(&tb.InlineButton{Unique: "unban"}, d.handleUnbanCallback)
+	b.Handle(&tb.InlineButton{Unique: "userinfo"}, d.handleUserInfoCallback)
 
 	b.Handle("/daily", d.ApplyShutdownMiddleware(func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Daily)
