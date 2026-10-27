@@ -15,17 +15,27 @@ Fork of the original Distortioner with per-user `/intensity`, optional `/ramp`, 
 - Send media / text, or reply with `/distort`
 - `/intensity` — show current strength (1–100, default 50)
 - `/intensity <n>` — set strength
+- `/sound` — show audio mode (`distort` default, or `bassboost`)
+- `/sound distort|bassboost` — set voice/video audio effect
 - `/ramp` — toggle progressive frame distortion (per-user; off by default)
 - `/ramp <from> <to>` — set progressive endpoints and enable
 - `/ramp off` — disable progressive ramp
-- `/unbanrequest [reason]` — ask admin to lift a ban
+- `/unbanrequest [message]` — ask admin to lift a ban (once per 24 hours)
 
 ### Admin commands
-- `/daily`, `/weekly`, `/monthly` — usage stats
+- `/daily`, `/weekly`, `/monthly` — usage stats, including active / new / total users
+- `/user <id|@username>` — user card: names, first/last seen, requests per day/week/month/all time, settings, ban status and history, with Ban/Unban buttons
+- `/topusers [day|week|month]` — most active users (default: week)
 - `/queue` — video queue size
 - `/status` — version, uptime, queue, maintenance
 - `/maintenance` — toggle maintenance mode
-- `/ban <id>` / `/unban <id>` / `/bannedusers` — persistent bans (also Ban button on `/start` alerts)
+- `/ban <id|@username> [reason]` — persistent ban; banning again with a new reason replaces it
+- `/unban <id|@username> [reason]` — lift a ban (the user is notified)
+- `/bannedusers` — bans with names, dates and reasons
+- `/ban`, `/unban` and `/user` also work as a reply to a forwarded message, a `/start` alert or a user card
+- `/start` alerts and unban requests have buttons: 🚫 Spam / NSFW / Other, ✅ Unban, 👤 Info
+
+Banned users get the "you are banned" reply (with the reason) at most once per hour. Every ban, unban, reason change and unban request is kept in the `ban_log` table. Per-user stats only cover requests made after this version is deployed: older rows store just the chat.
 - `/update [branch]` — pull git, rebuild image, recreate container (default branch: `wip`, override with `DISTORTIONER_UPDATE_BRANCH`)
 
 ## Docker support

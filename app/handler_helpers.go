@@ -70,7 +70,11 @@ func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity, rampFrom, rampT
 	}
 	defer tools.RemoveTemp(animationOutput, false)
 	soundOutput := filename + ".ogg"
-	err = distorters.DistortSound(filename, soundOutput, intensity)
+	soundMode := distorters.SoundModeDistort
+	if m := c.Message(); m != nil && m.Sender != nil {
+		soundMode = d.db.GetUserSoundMode(m.Sender.ID)
+	}
+	err = distorters.DistortSound(filename, soundOutput, intensity, soundMode)
 	if err != nil {
 		soundOutput = ""
 	} else {
