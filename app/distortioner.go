@@ -256,7 +256,8 @@ func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
 		return err
 	}
 	output := filename + ".ogg"
-	err = distorters.DistortSound(filename, output, intensity)
+	soundMode := d.db.GetUserSoundMode(m.Sender.ID)
+	err = distorters.DistortSound(filename, output, intensity, soundMode)
 	failed := err != nil
 	defer tools.RemoveTemp(filename, failed)
 	defer tools.RemoveTemp(output, failed)
@@ -326,6 +327,28 @@ func (d DistorterBot) handleIntensity(c tb.Context) error {
 	return c.Reply(fmt.Sprintf("Intensity set to %d.", n))
 }
 
+func (d DistorterBot) handleSound(c tb.Context) error {
+	m := c.Message()
+	if m == nil || m.Sender == nil {
+		return nil
+	}
+	payload := strings.ToLower(strings.TrimSpace(m.Payload))
+	if payload == "" {
+		mode := d.db.GetUserSoundMode(m.Sender.ID)
+		return c.Reply(fmt.Sprintf("Sound mode: %s. Options: distort (default vibrato), bassboost (max bass). Send /sound <mode>.", mode))
+	}
+	switch payload {
+	case "distort", "bassboost", "bass", "bass-boost", "bass_boost":
+		if err := d.db.SetUserSoundMode(m.Sender.ID, payload); err != nil {
+			d.logger.Error(err)
+			return c.Reply("Could not save setting.")
+		}
+		return c.Reply(fmt.Sprintf("Sound mode set to %s.", d.db.GetUserSoundMode(m.Sender.ID)))
+	default:
+		return c.Reply("Unknown mode. Use /sound distort or /sound bassboost.")
+	}
+}
+
 func (d DistorterBot) handleRamp(c tb.Context) error {
 	m := c.Message()
 	if m == nil || m.Sender == nil {
@@ -383,7 +406,7 @@ func (d DistorterBot) handleStart(c tb.Context) error {
 		return nil
 	}
 	welcome := "Send me a picture, a sticker, a voice message, a video[note] or a GIF and I'll distort it.\n" +
-		"Use /intensity (1–100) for strength, /ramp to toggle progressive frames (or /ramp <from> <to>)."
+		"Use /intensity (1–100) for strength, /sound distort|bassboost for audio, /ramp to toggle progressive frames."
 	if m.Sender.ID == d.adminID {
 		return c.Reply(welcome + "\n\n(admin online)")
 	}
@@ -728,7 +751,8 @@ func skipStatCommand(text string) bool {
 	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update", text == "/status",
 		text == "/ban", text == "/unban", text == "/bannedusers", text == "/unbanrequest", text == "/start":
 		return true
-	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/ramp"), strings.HasPrefix(text, "/update@"),
+	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/ramp"), strings.HasPrefix(text, "/sound"),
+		strings.HasPrefix(text, "/update@"),
 		strings.HasPrefix(text, "/ban"), strings.HasPrefix(text, "/unban"), strings.HasPrefix(text, "/bannedusers"),
 		strings.HasPrefix(text, "/unbanrequest"), strings.HasPrefix(text, "/start@"):
 		return true
@@ -841,6 +865,7 @@ func main() {
 	b.Handle("/start", d.handleStart)
 
 	b.Handle("/intensity", d.handleIntensity)
+	b.Handle("/sound", d.handleSound)
 	b.Handle("/ramp", d.handleRamp)
 	b.Handle("/status", d.handleStatus)
 	b.Handle("/update", d.handleUpdate)

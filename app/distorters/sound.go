@@ -6,8 +6,34 @@ import (
 	"strings"
 )
 
-func soundFilterParts(intensity int) []string {
+const (
+	SoundModeDistort   = "distort"
+	SoundModeBassBoost = "bassboost"
+)
+
+// NormalizeSoundMode returns a known mode, or SoundModeDistort for empty/unknown values.
+func NormalizeSoundMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case SoundModeBassBoost, "bass", "bass-boost", "bass_boost":
+		return SoundModeBassBoost
+	case SoundModeDistort, "":
+		return SoundModeDistort
+	default:
+		return SoundModeDistort
+	}
+}
+
+func soundFilterParts(mode string, intensity int) []string {
 	i := clampIntensity(intensity)
+	switch NormalizeSoundMode(mode) {
+	case SoundModeBassBoost:
+		return bassBoostFilterParts(i)
+	default:
+		return distortFilterParts(i)
+	}
+}
+
+func distortFilterParts(i int) []string {
 	depth, freq := VibratoParams(i)
 	parts := []string{fmt.Sprintf("vibrato=f=%.3f:d=%.3f", freq, depth)}
 
@@ -24,6 +50,19 @@ func soundFilterParts(intensity int) []string {
 	return parts
 }
 
+func bassBoostFilterParts(i int) []string {
+	// ffmpeg bass gain is capped at ±20; intensity maps into that range and stays loud.
+	gain := 8.0 + 12.0*float64(i)/100.0 // ~8.1 … 20
+	if gain > 20 {
+		gain = 20
+	}
+	return []string{
+		fmt.Sprintf("bass=g=%.1f:f=110:w=0.7", gain),
+		fmt.Sprintf("equalizer=f=60:width_type=h:width=50:g=%.1f", gain*0.6),
+		"alimiter=limit=0.95:level=disabled",
+	}
+}
+
 // VibratoParams returns ffmpeg vibrato depth [0,1] and frequency for intensity 1–100.
 func VibratoParams(intensity int) (depth, freq float64) {
 	i := clampIntensity(intensity)
@@ -32,11 +71,16 @@ func VibratoParams(intensity int) (depth, freq float64) {
 	return depth, freq
 }
 
-func DistortSound(filename, output string, intensity int) error {
+// SoundFilterString is the ffmpeg -af filter graph for tests / debugging.
+func SoundFilterString(mode string, intensity int) string {
+	return strings.Join(soundFilterParts(mode, intensity), ",")
+}
+
+func DistortSound(filename, output string, intensity int, mode string) error {
 	return runFfmpeg(
 		"-i", filename,
 		"-vn",
 		"-c:a", "libopus",
-		"-af", strings.Join(soundFilterParts(intensity), ","),
+		"-af", SoundFilterString(mode, intensity),
 		output)
 }

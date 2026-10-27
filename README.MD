@@ -15,6 +15,8 @@ Fork of the original Distortioner with per-user `/intensity`, optional `/ramp`, 
 - Send media / text, or reply with `/distort`
 - `/intensity` — show current strength (1–100, default 50)
 - `/intensity <n>` — set strength
+- `/sound` — show audio mode (`distort` default, or `bassboost`)
+- `/sound distort|bassboost` — set voice/video audio effect
 - `/ramp` — toggle progressive frame distortion (per-user; off by default)
 - `/ramp <from> <to>` — set progressive endpoints and enable
 - `/ramp off` — disable progressive ramp

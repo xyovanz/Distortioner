@@ -2,6 +2,7 @@ package stats
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -105,6 +106,10 @@ func InitDB(logger *zap.SugaredLogger) *DistortionerDB {
 	} else if !isSQLiteDuplicateColumn(err) {
 		logger.Fatal(err)
 	}
+	_, err = db.Exec(`alter table user_settings add column sound_mode text not null default 'distort'`)
+	if err != nil && !isSQLiteDuplicateColumn(err) {
+		logger.Fatal(err)
+	}
 	_, err = db.Exec(`create table if not exists banned_users(user_id integer not null primary key, banned_at text not null)`)
 	if err != nil {
 		logger.Fatal(err)
@@ -141,6 +146,39 @@ func (d *DistortionerDB) SetUserIntensity(userID int64, intensity int) error {
 		insert into user_settings(user_id, intensity) values(?, ?)
 		on conflict(user_id) do update set intensity = excluded.intensity`,
 		userID, intensity)
+	return err
+}
+
+const DefaultSoundMode = "distort"
+
+func (d *DistortionerDB) GetUserSoundMode(userID int64) string {
+	var mode sql.NullString
+	err := d.db.QueryRow(`select sound_mode from user_settings where user_id = ?`, userID).Scan(&mode)
+	if err != nil || !mode.Valid || mode.String == "" {
+		return DefaultSoundMode
+	}
+	switch strings.ToLower(mode.String) {
+	case "bassboost", "bass", "bass-boost", "bass_boost":
+		return "bassboost"
+	default:
+		return DefaultSoundMode
+	}
+}
+
+func (d *DistortionerDB) SetUserSoundMode(userID int64, mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "bassboost", "bass", "bass-boost", "bass_boost":
+		mode = "bassboost"
+	case "distort", "":
+		mode = DefaultSoundMode
+	default:
+		return fmt.Errorf("unknown sound mode %q", mode)
+	}
+	_, err := d.db.Exec(`
+		insert into user_settings(user_id, intensity, sound_mode) values(?, ?, ?)
+		on conflict(user_id) do update set sound_mode = excluded.sound_mode`,
+		userID, DefaultIntensity, mode)
 	return err
 }
 
