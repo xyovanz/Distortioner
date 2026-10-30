@@ -1,7 +1,6 @@
 package distorters
 
 import (
-	"log"
 	"math"
 	"os/exec"
 	"strconv"
@@ -58,20 +57,38 @@ func liquidRescaleFraction(intensity int) (liquid float64, resizeStretch float64
 	return liquid, resizeStretch
 }
 
+// DistortImage distorts a photo or static sticker in place, keeping its format.
 func DistortImage(path string, intensity int) error {
+	return distortImage(path, intensity)
+}
+
+// distortFrameImage distorts an intermediate PNG video frame. Frames live for seconds, so they
+// are written with zlib level 1 and no filtering instead of the default (slow) compression.
+func distortFrameImage(path string, intensity int) error {
+	return distortImage(path, intensity, "-quality", "10")
+}
+
+func distortImage(path string, intensity int, outputOpts ...string) error {
 	liquid, resizeStretch := liquidRescaleFraction(intensity)
-	cmd := exec.Command(
-		"magick",
+	args := []string{
+		// Parallelism comes from running one process per core; OpenMP threads on top oversubscribe.
+		"-limit", "thread", "1",
 		path,
 		"-resize", "512x512>", // A reasonable cutoff, I hope
 		"-liquid-rescale", formatPercent(liquid),
 		"-resize", formatPercent(resizeStretch),
-		path)
+	}
+	args = append(args, outputOpts...)
+	args = append(args, path)
+
+	release := acquireCPU()
+	defer release()
+	cmd := exec.Command("magick", args...)
 	setProcessGroup(cmd)
 	err := cmd.Run()
 	if err != nil {
 		err = errors.WithStack(err)
-		log.Println(err)
+		logger.Errorw("magick failed", "err", err, "path", path)
 	}
 	return err
 }

@@ -5,6 +5,7 @@ package stats
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -44,6 +45,44 @@ func TestTouchUserAndLookup(t *testing.T) {
 	require.Equal(t, 1, newUsers)
 }
 
+func TestShouldTouchDebounces(t *testing.T) {
+	d := testDB(t)
+	u := &tb.User{ID: 1, Username: "a"}
+	now := time.Now()
+	require.True(t, d.shouldTouch(u, now))
+	require.False(t, d.shouldTouch(u, now.Add(time.Minute)))
+	require.True(t, d.shouldTouch(&tb.User{ID: 1, Username: "b"}, now.Add(2*time.Minute)), "name change writes")
+	require.True(t, d.shouldTouch(&tb.User{ID: 1, Username: "b"}, now.Add(13*time.Minute)), "stale last_seen writes")
+}
+
+func TestGetUserSettings(t *testing.T) {
+	d := testDB(t)
+	require.Equal(t, Settings{Intensity: DefaultIntensity}, d.GetUserSettings(1))
+
+	require.NoError(t, d.SetUserIntensity(1, 70))
+	require.NoError(t, d.SetUserSoundMode(1, "bassboost"))
+	require.Equal(t, Settings{Intensity: 70, SoundMode: "bassboost"}, d.GetUserSettings(1))
+
+	require.NoError(t, d.SetUserRamp(1, 20, 90))
+	require.Equal(t, Settings{Intensity: 70, RampFrom: 20, RampTo: 90, SoundMode: "bassboost"}, d.GetUserSettings(1))
+	require.NoError(t, d.ClearUserRamp(1))
+	require.Zero(t, d.GetUserSettings(1).RampFrom)
+}
+
+func TestStatsFlushOnClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.sqlite")
+	d := openDB(zap.NewExample().Sugar(), path)
+	d.SaveStat(&tb.Message{Chat: &tb.Chat{ID: 5}, Sender: &tb.User{ID: 5}, Text: "x"}, false)
+	d.Close()
+	d.SaveStat(&tb.Message{Chat: &tb.Chat{ID: 5}, Sender: &tb.User{ID: 5}, Text: "x"}, false) // after Close: ignored
+
+	d = openDB(zap.NewExample().Sugar(), path)
+	defer d.Close()
+	s, err := d.GetUserStat(5, "")
+	require.NoError(t, err)
+	require.Equal(t, 1, s.Total)
+}
+
 func TestSaveStatTracksSender(t *testing.T) {
 	d := testDB(t)
 	alice := &tb.User{ID: 1}
@@ -54,6 +93,7 @@ func TestSaveStatTracksSender(t *testing.T) {
 	d.SaveStat(&tb.Message{Chat: group, Sender: alice, Text: "hi"}, false)
 	// Bob replies with /distort to Alice's photo: counts for Bob.
 	d.SaveStat(&tb.Message{Chat: group, Sender: bob, Text: "/distort", ReplyTo: photo}, true)
+	d.FlushStats()
 
 	s, err := d.GetUserStat(1, Daily)
 	require.NoError(t, err)

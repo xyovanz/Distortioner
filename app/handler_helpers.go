@@ -9,12 +9,12 @@ import (
 	tb "gopkg.in/telebot.v3"
 
 	"github.com/graynk/distortioner/distorters"
+	"github.com/graynk/distortioner/stats"
 	"github.com/graynk/distortioner/tools"
 )
 
 const (
-	NotEnoughRights = "The bot does not have enough rights to send media to your chat"
-	NotSupported    = "Not supported yet, sorry"
+	NotEnoughRights             = "The bot does not have enough rights to send media to your chat"
 	AnimatedStickersUnsupported = "Animated stickers (.tgs) aren't supported — send a static or video sticker instead."
 )
 
@@ -25,7 +25,9 @@ const (
 	Send
 )
 
-func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity, rampFrom, rampTo int) (*tb.Message, string, string, error) {
+// HandleAnimationCommon downloads and distorts a GIF/video/video note, reporting progress in a
+// reply. withAudio also runs the source's audio through the user's sound filter in the same encode.
+func (d DistorterBot) HandleAnimationCommon(c tb.Context, s stats.Settings, withAudio bool) (*tb.Message, string, string, error) {
 	m := c.Message()
 	b := c.Bot()
 	progressMessage, err := d.SendMessage(c, "Downloading...", Reply)
@@ -39,8 +41,12 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity, rampFrom, r
 		return progressMessage, "", "", errors.New(distorters.FailedDownload)
 	}
 	animationOutput := filename + ".mp4"
+	var audio *distorters.AudioOptions
+	if withAudio {
+		audio = &distorters.AudioOptions{Source: filename, Mode: s.SoundMode, Intensity: s.Intensity}
+	}
 	progressChan := make(chan string, 3)
-	go distorters.DistortVideo(filename, d.codec, animationOutput, intensity, rampFrom, rampTo, progressChan)
+	go distorters.DistortVideo(filename, d.codec, animationOutput, s.Intensity, s.RampFrom, s.RampTo, audio, progressChan)
 	for report := range progressChan {
 		if progressMessage == nil {
 			continue
@@ -60,47 +66,14 @@ func (d DistorterBot) HandleAnimationCommon(c tb.Context, intensity, rampFrom, r
 	return progressMessage, filename, animationOutput, nil
 }
 
-func (d DistorterBot) HandleVideoCommon(c tb.Context, intensity, rampFrom, rampTo int) (string, *tb.Message, error) {
-	progressMessage, filename, animationOutput, err := d.HandleAnimationCommon(c, intensity, rampFrom, rampTo)
-	failed := err != nil
-	defer tools.RemoveTemp(filename, failed)
-	if failed {
-		// Callers update the progress message; avoid double DoneMessage here.
-		return "", progressMessage, err
-	}
-	defer tools.RemoveTemp(animationOutput, false)
-	soundOutput := filename + ".ogg"
-	soundMode := distorters.SoundModeDistort
-	if m := c.Message(); m != nil && m.Sender != nil {
-		soundMode = d.db.GetUserSoundMode(m.Sender.ID)
-	}
-	err = distorters.DistortSound(filename, soundOutput, intensity, soundMode)
-	if err != nil {
-		soundOutput = ""
-	} else {
-		defer tools.RemoveTemp(soundOutput, false)
-	}
-	output := filename + "Final.mp4"
-	if progressMessage != nil {
-		// intentionally not updating progressMessage variable
-		c.Edit(progressMessage, "Muxing frames with sound back together...")
-	}
-	err = distorters.CollectAnimationAndSound(animationOutput, soundOutput, output)
-	if err != nil {
-		tools.RemoveTemp(output, true)
-		return "", progressMessage, errors.New(distorters.FailedEncode)
-	}
-	return output, progressMessage, nil
-}
-
-func (d DistorterBot) HandleVideoSticker(c tb.Context, intensity, rampFrom, rampTo int) (string, string, error) {
+func (d DistorterBot) HandleVideoSticker(c tb.Context, s stats.Settings) (string, string, error) {
 	filename, err := tools.JustGetTheFile(c.Bot(), c.Message())
 	if err != nil {
 		d.logger.Error(err)
 		return "", "", errors.New(distorters.FailedDownload)
 	}
 	animationOutput := filename + ".webm"
-	err = distorters.DistortVideoSticker(filename, animationOutput, intensity, rampFrom, rampTo)
+	err = distorters.DistortVideoSticker(filename, animationOutput, s.Intensity, s.RampFrom, s.RampTo)
 	if err != nil {
 		return filename, animationOutput, err
 	}
@@ -140,14 +113,14 @@ func (d DistorterBot) DoneMessageWithRepeater(b *tb.Bot, m *tb.Message, failMsg 
 func (d DistorterBot) SendMessage(c tb.Context, toSend interface{}, method MethodOfResponding) (*tb.Message, error) {
 	b := c.Bot()
 	message := c.Message()
-
-	var m *tb.Message
-	var err error
-	if method == Reply {
-		m, err = b.Reply(message, toSend)
-	} else {
-		m, err = b.Send(message.Chat, toSend)
+	send := func() (*tb.Message, error) {
+		if method == Reply {
+			return b.Reply(message, toSend)
+		}
+		return b.Send(message.Chat, toSend)
 	}
+
+	m, err := send()
 	for err != nil {
 		switch {
 		case strings.Contains(err.Error(), "not enough rights to send"):
@@ -166,7 +139,8 @@ func (d DistorterBot) SendMessage(c tb.Context, toSend interface{}, method Metho
 			return nil, err
 		}
 		time.Sleep(time.Duration(timeout) * time.Second)
-		m, err = b.Reply(message, toSend)
+		// Retry the same way: a Send fallback must not turn back into a Reply.
+		m, err = send()
 		if err != nil {
 			d.logger.Error(err)
 		}

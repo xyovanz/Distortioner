@@ -56,10 +56,6 @@ func (vw *VideoWorker) QueueStats() (int, int) {
 	return vw.queue.Stats()
 }
 
-func (vw *VideoWorker) QueuePosition(userID int64) int {
-	return vw.queue.Position(userID)
-}
-
 func (vw *VideoWorker) IsBusy() bool {
 	return vw.queue.Len() > vw.workerCount
 }

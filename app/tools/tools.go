@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -81,14 +82,42 @@ func RemoveTemp(path string, failed bool) {
 	_ = os.Remove(path)
 }
 
+// tempDir holds downloads and every file derived from them (frames, outputs).
+var tempDir = filepath.Join(os.TempDir(), "distortioner")
+
+// InitTempDir picks the temp dir (DISTORTIONER_TMP_DIR, default <os temp>/distortioner), creates
+// it and removes files left by a previous run that crashed mid-job. Only names starting with a
+// UUID are removed, so pointing it at a shared directory is safe.
+func InitTempDir() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv("DISTORTIONER_TMP_DIR")); dir != "" {
+		tempDir = dir
+	}
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return tempDir, err
+	}
+	if KeepFailedTemps() {
+		return tempDir, nil
+	}
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		return tempDir, err
+	}
+	for _, e := range entries {
+		if name := e.Name(); len(name) >= 36 && uuid.Validate(name[:36]) == nil {
+			_ = os.RemoveAll(filepath.Join(tempDir, name))
+		}
+	}
+	return tempDir, nil
+}
+
+// JustGetTheFile downloads the message's media into the temp dir. Callers tell the user on error.
 func JustGetTheFile(b *tb.Bot, m *tb.Message) (string, error) {
-	filename := uuid.New().String()
+	filename := filepath.Join(tempDir, uuid.New().String())
 	file := m.Media().MediaFile()
 	err := b.Download(file, filename)
 	if err != nil {
-		b.Reply(m, "Failed to download media")
+		_ = os.Remove(filename)
 	}
-
 	return filename, err
 }
 

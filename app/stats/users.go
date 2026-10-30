@@ -141,9 +141,30 @@ func parseTime(s string) time.Time {
 // periodStartUTC converts a Period to the RFC3339 UTC lower bound used by users/ban_log columns.
 const periodStartUTC = `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)`
 
+// touchInterval is how stale users.last_seen may get before TouchUser writes again.
+const touchInterval = 10 * time.Minute
+
+type touchState struct {
+	at    time.Time
+	names string
+}
+
+// shouldTouch reports whether the user row needs a write: first sight since start, a name
+// change, or last_seen older than touchInterval. Records the write when it says yes.
+func (d *DistortionerDB) shouldTouch(u *tb.User, now time.Time) bool {
+	names := u.Username + "\x00" + u.FirstName + "\x00" + u.LastName
+	d.touchMu.Lock()
+	defer d.touchMu.Unlock()
+	if prev, ok := d.touched[u.ID]; ok && prev.names == names && now.Sub(prev.at) < touchInterval {
+		return false
+	}
+	d.touched[u.ID] = touchState{at: now, names: names}
+	return true
+}
+
 // TouchUser records that the user was seen now, refreshing their names.
 func (d *DistortionerDB) TouchUser(u *tb.User) {
-	if u == nil || u.IsBot {
+	if u == nil || u.IsBot || !d.shouldTouch(u, time.Now()) {
 		return
 	}
 	now := nowUTC()

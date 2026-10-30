@@ -3,9 +3,9 @@ package distorters
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -76,14 +76,32 @@ func UserFacingError(err error) string {
 	}
 }
 
-func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo int, progressChan chan string) {
+// MaxVideoSeconds is the longest video/GIF/video note the bot will distort.
+const MaxVideoSeconds = 60
+
+// MaxVideoStickerSeconds is the longest video sticker the bot will distort.
+const MaxVideoStickerSeconds = 30
+
+// AudioOptions makes the final encode also carry the source's audio through the sound filter,
+// so a video needs one ffmpeg pass instead of encode + separate audio + mux.
+type AudioOptions struct {
+	Source    string
+	Mode      string
+	Intensity int
+}
+
+// framePattern is the ffmpeg numbered-file pattern for frames inside framesDir.
+func framePattern(framesDir string) string {
+	return filepath.Join(framesDir, "%04d.png")
+}
+
+func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo int, audio *AudioOptions, progressChan chan string) {
 	progressChan <- "Extracting frames..."
 	defer close(progressChan)
 	framesDir := filename + "Frames"
 	err := os.Mkdir(framesDir, 0755)
 	if err != nil {
-		err = errors.WithStack(err)
-		log.Println(err)
+		logger.Errorw("create frames dir", "err", errors.WithStack(err))
 		progressChan <- Failed
 		return
 	}
@@ -92,11 +110,11 @@ func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo in
 	if err != nil {
 		progressChan <- FailedProbe
 		return
-	} else if duration > 60 {
+	} else if duration > MaxVideoSeconds {
 		progressChan <- TooLong
 		return
 	}
-	numberedFileName := fmt.Sprintf("%s/%s%%04d.png", framesDir, filename)
+	numberedFileName := framePattern(framesDir)
 	err = extractFramesFromVideo(frameRateFraction, filename, numberedFileName)
 	if err != nil {
 		progressChan <- FailedExtract
@@ -125,11 +143,16 @@ func DistortVideo(filename, codec, output string, intensity, rampFrom, rampTo in
 		}
 	}
 	progressChan <- "Collecting frames..."
-	err = collectFramesToVideo(numberedFileName, frameRateFraction, codec, output)
+	err = collectFramesToVideo(numberedFileName, frameRateFraction, codec, output, audio)
+	if err != nil && audio != nil {
+		// Keep the old behaviour of sending a silent video when only the audio part fails.
+		logger.Warnw("encode with audio failed, retrying without", "err", err)
+		_ = os.Remove(output)
+		err = collectFramesToVideo(numberedFileName, frameRateFraction, codec, output, nil)
+	}
 	if err != nil {
 		progressChan <- FailedEncode
 	}
-	return
 }
 
 func GetFrameRateFractionAndDuration(filename string) (string, float64, error) {
@@ -148,7 +171,7 @@ func GetFrameRateFractionAndDuration(filename string) (string, float64, error) {
 	if err != nil {
 		stderr := truncateLog(errbuf.String(), ffmpegStderrLimit)
 		last := lastNonEmptyLine(stderr)
-		log.Printf("ffprobe failed exit=%v file=%q stderr=%q", err, filename, stderr)
+		logger.Errorw("ffprobe failed", "err", err, "file", filename, "stderr", stderr)
 		if last != "" {
 			return "", 0, errors.Wrapf(err, "ffprobe: %s", last)
 		}
@@ -158,38 +181,56 @@ func GetFrameRateFractionAndDuration(filename string) (string, float64, error) {
 	if len(split) < 2 {
 		return "", 0, errors.New(FailedProbe)
 	}
-	duration, err := strconv.ParseFloat(split[1], 32)
+	duration, err := strconv.ParseFloat(strings.TrimSpace(split[1]), 64)
 	if err != nil {
 		err = errors.WithStack(err)
-		log.Println(err)
+		logger.Errorw("parse ffprobe duration", "err", err)
 	}
 	return split[0], duration, err
 }
 
+// fitFrameFilter shrinks frames into the same 512x512 box DistortImage resizes to first, so
+// full-HD sources don't write (and magick doesn't read) frames ~14x larger than needed.
+const fitFrameFilter = "scale='min(512,iw)':'min(512,ih)':force_original_aspect_ratio=decrease"
+
+// fastPNG keeps intermediate frames cheap to write; they are deleted after encoding.
+var fastPNG = []string{"-compression_level", "1"}
+
 func extractFramesFromVideo(frameRateFraction, filename, numberedFileName string) error {
-	return runFfmpeg("-i", filename,
+	args := []string{"-i", filename,
 		"-r", frameRateFraction,
-		numberedFileName)
+		"-vf", fitFrameFilter}
+	args = append(args, fastPNG...)
+	return runFfmpeg(append(args, numberedFileName)...)
 }
 
 func extractFramesFromVideoSticker(frameRateFraction, filename, numberedFileName string) error {
-	return runFfmpeg("-vcodec", "libvpx-vp9",
+	args := []string{"-vcodec", "libvpx-vp9",
 		"-i", filename,
 		"-r", frameRateFraction,
-		"-pix_fmt", "rgba",
-		numberedFileName)
+		"-pix_fmt", "rgba"}
+	args = append(args, fastPNG...)
+	return runFfmpeg(append(args, numberedFileName)...)
 }
 
-func collectFramesToVideo(numberedFileName, frameRateFraction, codec, filename string) error {
+func collectFramesToVideo(numberedFileName, frameRateFraction, codec, filename string, audio *AudioOptions) error {
+	args := []string{"-r", frameRateFraction, "-i", numberedFileName}
+	if audio != nil {
+		args = append(args, "-i", audio.Source,
+			"-map", "0:v", "-map", "1:a:0?",
+			"-af", SoundFilterString(audio.Mode, audio.Intensity),
+			"-c:a", "libopus")
+	} else {
+		args = append(args, "-an")
+	}
 	// libx264 + yuv420p requires even width/height; liquid-rescale can leave odd sizes (e.g. 383x383).
-	return runFfmpeg("-r", frameRateFraction,
-		"-i", numberedFileName,
+	args = append(args,
 		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
 		"-f", "mp4",
 		"-c:v", codec,
-		"-an",
 		"-pix_fmt", "yuv420p",
 		filename)
+	return runFfmpeg(args...)
 }
 
 func collectFramesToVideoSticker(numberedFileName, frameRateFraction, filename string) error {
@@ -218,7 +259,7 @@ func drainFrameSignals(doneChan <-chan int, received, total int) {
 }
 
 // distortFrame is the per-frame image distort hook (overridable in tests).
-var distortFrame = DistortImage
+var distortFrame = distortFrameImage
 
 func poolDistortImages(frameDir string, doneChan chan int, intensity, rampFrom, rampTo int) {
 	cpuCount := runtime.NumCPU()
@@ -239,7 +280,7 @@ func poolDistortImages(frameDir string, doneChan chan int, intensity, rampFrom, 
 		go func(i int, frame string) {
 			defer func() { <-sem }()
 			frameIntensity := FrameIntensity(intensity, rampFrom, rampTo, i, total)
-			err := distortFrame(fmt.Sprintf("%s/%s", frameDir, frame), frameIntensity)
+			err := distortFrame(filepath.Join(frameDir, frame), frameIntensity)
 			if err != nil {
 				// Exactly one completion signal per frame (failure).
 				doneChan <- -1

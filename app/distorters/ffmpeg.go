@@ -2,14 +2,31 @@ package distorters
 
 import (
 	"bytes"
-	"log"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 )
 
 const ffmpegStderrLimit = 800
+
+var logger = zap.NewNop().Sugar()
+
+// SetLogger routes this package's logs into the bot's logger.
+func SetLogger(l *zap.SugaredLogger) {
+	logger = l
+}
+
+// cpuSlots bounds concurrent CPU-heavy processes (magick per image/frame, audio ffmpeg) across
+// every job, so parallel videos and photos share the cores instead of oversubscribing them.
+var cpuSlots = make(chan struct{}, runtime.NumCPU())
+
+func acquireCPU() (release func()) {
+	cpuSlots <- struct{}{}
+	return func() { <-cpuSlots }
+}
 
 func runFfmpeg(args ...string) error {
 	var outbuf, errbuf bytes.Buffer
@@ -21,7 +38,7 @@ func runFfmpeg(args ...string) error {
 	if err != nil {
 		stderr := truncateLog(errbuf.String(), ffmpegStderrLimit)
 		last := lastNonEmptyLine(stderr)
-		log.Printf("ffmpeg failed exit=%v args=%q stderr=%q", err, strings.Join(args, " "), stderr)
+		logger.Errorw("ffmpeg failed", "err", err, "args", strings.Join(args, " "), "stderr", stderr)
 		if last != "" {
 			return errors.Wrapf(err, "ffmpeg: %s", last)
 		}

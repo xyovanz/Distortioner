@@ -15,6 +15,7 @@ type MessageRange struct {
 type RateLimiter struct {
 	usersRate map[int64]MessageRange
 	mu        sync.Mutex
+	lastSweep int64
 }
 
 func NewRateLimiter() *RateLimiter {
@@ -27,6 +28,14 @@ func NewRateLimiter() *RateLimiter {
 func (r *RateLimiter) GetRateOverPeriod(userId int64, utc int64) (int, int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if utc-r.lastSweep >= TimePeriodSeconds {
+		r.lastSweep = utc
+		for id, mr := range r.usersRate {
+			if utc-mr.StartUtc >= TimePeriodSeconds {
+				delete(r.usersRate, id)
+			}
+		}
+	}
 	messageRange, ok := r.usersRate[userId]
 	if !ok {
 		r.usersRate[userId] = MessageRange{
