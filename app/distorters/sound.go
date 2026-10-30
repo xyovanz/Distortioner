@@ -11,16 +11,24 @@ const (
 	SoundModeBassBoost = "bassboost"
 )
 
-// NormalizeSoundMode returns a known mode, or SoundModeDistort for empty/unknown values.
-func NormalizeSoundMode(mode string) string {
+// ParseSoundMode maps user input (including aliases) to a known mode.
+func ParseSoundMode(mode string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case SoundModeBassBoost, "bass", "bass-boost", "bass_boost":
-		return SoundModeBassBoost
+		return SoundModeBassBoost, true
 	case SoundModeDistort, "":
-		return SoundModeDistort
+		return SoundModeDistort, true
 	default:
-		return SoundModeDistort
+		return "", false
 	}
+}
+
+// NormalizeSoundMode returns a known mode, or SoundModeDistort for empty/unknown values.
+func NormalizeSoundMode(mode string) string {
+	if m, ok := ParseSoundMode(mode); ok {
+		return m
+	}
+	return SoundModeDistort
 }
 
 func soundFilterParts(mode string, intensity int) []string {
@@ -77,6 +85,8 @@ func SoundFilterString(mode string, intensity int) string {
 }
 
 func DistortSound(filename, output string, intensity int, mode string) error {
+	release := acquireCPU()
+	defer release()
 	return runFfmpeg(
 		"-i", filename,
 		"-vn",

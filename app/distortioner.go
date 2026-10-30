@@ -33,7 +33,6 @@ type DistorterBot struct {
 	adminID     int64
 	rl          *tools.RateLimiter
 	logger      *zap.SugaredLogger
-	mu          *sync.Mutex
 	graceWg     *sync.WaitGroup
 	videoWorker *tools.VideoWorker
 	codec       string
@@ -42,24 +41,24 @@ type DistorterBot struct {
 
 	bannedNotice  *tools.Throttle // "you are banned" replies, once per hour per user
 	unbanRequests *tools.Throttle // /unbanrequest, once per day per user
+	chatRights    *chatRightsCache
 }
 
-func (d DistorterBot) withIntensity(h func(tb.Context, int) error) tb.HandlerFunc {
+// mediaSettings reads the user's distortion settings in one query, with the sound mode normalized.
+func (d DistorterBot) mediaSettings(userID int64) stats.Settings {
+	s := d.db.GetUserSettings(userID)
+	s.SoundMode = distorters.NormalizeSoundMode(s.SoundMode)
+	return s
+}
+
+func (d DistorterBot) withSettings(h func(tb.Context, stats.Settings) error) tb.HandlerFunc {
 	return func(c tb.Context) error {
 		m := c.Message()
 		if m == nil || m.Sender == nil {
 			return nil
 		}
-		return h(c, d.db.GetUserIntensity(m.Sender.ID))
+		return h(c, d.mediaSettings(m.Sender.ID))
 	}
-}
-
-func (d DistorterBot) userRamp(userID int64) (from, to int) {
-	from, to, ok := d.db.GetUserRamp(userID)
-	if !ok {
-		return 0, 0
-	}
-	return from, to
 }
 
 func failStatus(err error, progress *tb.Message) string {
@@ -69,11 +68,27 @@ func failStatus(err error, progress *tb.Message) string {
 	return distorters.UserFacingError(err)
 }
 
-// submitVideoJob gates size/rate-limit, enqueues work, and tells the user their queue position when busy.
-func (d DistorterBot) submitVideoJob(c tb.Context, fileSize int64, work func()) error {
+// download fetches the message's media into the temp dir and tells the user if that failed.
+func (d DistorterBot) download(c tb.Context) (string, error) {
+	filename, err := tools.JustGetTheFile(c.Bot(), c.Message())
+	if err != nil {
+		d.logger.Error(err)
+		d.SendMessageWithRepeater(c, distorters.FailedDownload)
+	}
+	return filename, err
+}
+
+// submitVideoJob gates size/duration/rate-limit, enqueues work, and tells the user their queue
+// position when busy. maxDuration 0 skips the duration check (stickers carry no duration).
+func (d DistorterBot) submitVideoJob(c tb.Context, fileSize int64, duration, maxDuration int, work func()) error {
 	m := c.Message()
 	if fileSize > MaxSizeMb {
 		return d.SendMessageWithRepeater(c, distorters.TooBig)
+	}
+	// Telegram reports the duration up front, so overlong media is rejected before it is
+	// downloaded or takes a queue slot. DistortVideo still checks with ffprobe.
+	if maxDuration > 0 && duration > maxDuration {
+		return d.SendMessageWithRepeater(c, distorters.TooLong)
 	}
 	if rate, diff := d.rl.GetRateOverPeriod(m.Chat.ID, time.Now().Unix()); rate > tools.AllowedOverTime {
 		return d.SendMessageWithRepeater(c, tools.FormatRateLimitResponse(diff))
@@ -89,28 +104,22 @@ func (d DistorterBot) submitVideoJob(c tb.Context, fileSize int64, work func()) 
 	return nil
 }
 
-func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) error {
-	m := c.Message()
+// handleVideoLike queues a GIF, video or video note; wrap builds the reply from the output file.
+func (d DistorterBot) handleVideoLike(c tb.Context, s stats.Settings, fileSize int64, duration int, withAudio bool, wrap func(output string) interface{}) error {
 	b := c.Bot()
-	rampFrom, rampTo := d.userRamp(m.Sender.ID)
-	return d.submitVideoJob(c, m.Animation.FileSize, func() {
-		progressMessage, filename, output, err := d.HandleAnimationCommon(c, intensity, rampFrom, rampTo)
+	return d.submitVideoJob(c, fileSize, duration, distorters.MaxVideoSeconds, func() {
+		progressMessage, filename, output, err := d.HandleAnimationCommon(c, s, withAudio)
 		failed := err != nil
 		defer tools.RemoveTemp(filename, failed)
 		defer tools.RemoveTemp(output, failed)
 		if failed {
+			d.logger.Error(err)
 			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
 				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
 			}
-			d.logger.Error(err)
 			return
 		}
-
-		distorted := &tb.Animation{File: tb.FromDisk(output), FileName: output}
-		if m.Caption != "" {
-			distorted.Caption = distorters.DistortText(m.Caption, intensity)
-		}
-		err = d.SendMessageWithRepeater(c, distorted)
+		err = d.SendMessageWithRepeater(c, wrap(output))
 		d.DoneMessageWithRepeater(b, progressMessage, "")
 		if err != nil {
 			d.logger.Error(err)
@@ -118,50 +127,62 @@ func (d DistorterBot) handleAnimationDistortion(c tb.Context, intensity int) err
 	})
 }
 
-func (d DistorterBot) handlePhotoDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handleAnimationDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
-	filename, err := tools.JustGetTheFile(c.Bot(), m)
+	return d.handleVideoLike(c, s, m.Animation.FileSize, m.Animation.Duration, false, func(output string) interface{} {
+		distorted := &tb.Animation{File: tb.FromDisk(output), FileName: filepath.Base(output)}
+		if m.Caption != "" {
+			distorted.Caption = distorters.DistortText(m.Caption, s.Intensity)
+		}
+		return distorted
+	})
+}
+
+func (d DistorterBot) handleVideoDistortion(c tb.Context, s stats.Settings) error {
+	m := c.Message()
+	return d.handleVideoLike(c, s, m.Video.FileSize, m.Video.Duration, true, func(output string) interface{} {
+		return &tb.Video{File: tb.FromDisk(output)}
+	})
+}
+
+func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, s stats.Settings) error {
+	m := c.Message()
+	return d.handleVideoLike(c, s, m.VideoNote.FileSize, m.VideoNote.Duration, true, func(output string) interface{} {
+		return &tb.VideoNote{File: tb.FromDisk(output)}
+	})
+}
+
+// handleImageDistortion distorts a photo or static sticker; wrap builds the reply.
+func (d DistorterBot) handleImageDistortion(c tb.Context, s stats.Settings, wrap func(file tb.File) interface{}) error {
+	filename, err := d.download(c)
 	if err != nil {
-		d.logger.Error(err)
 		return err
 	}
-	err = distorters.DistortImage(filename, intensity)
+	err = distorters.DistortImage(filename, s.Intensity)
 	failed := err != nil
 	defer tools.RemoveTemp(filename, failed)
 	if failed {
 		d.SendMessageWithRepeater(c, distorters.FailedDistortImage)
 		return err
 	}
-	distorted := &tb.Photo{File: tb.FromDisk(filename)}
-	if m.Caption != "" {
-		distorted.Caption = distorters.DistortText(m.Caption, intensity)
-	}
-	return d.SendMessageWithRepeater(c, distorted)
+	return d.SendMessageWithRepeater(c, wrap(tb.FromDisk(filename)))
 }
 
-func (d DistorterBot) handleRegularStickerDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handlePhotoDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
-	filename, err := tools.JustGetTheFile(c.Bot(), m)
-	if err != nil {
-		d.logger.Error(err)
-		return err
-	}
-	err = distorters.DistortImage(filename, intensity)
-	failed := err != nil
-	defer tools.RemoveTemp(filename, failed)
-	if failed {
-		d.SendMessageWithRepeater(c, distorters.FailedDistortImage)
-		return err
-	}
-	distorted := &tb.Sticker{File: tb.FromDisk(filename)}
-	return d.SendMessageWithRepeater(c, distorted)
+	return d.handleImageDistortion(c, s, func(file tb.File) interface{} {
+		distorted := &tb.Photo{File: file}
+		if m.Caption != "" {
+			distorted.Caption = distorters.DistortText(m.Caption, s.Intensity)
+		}
+		return distorted
+	})
 }
 
-func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
-	rampFrom, rampTo := d.userRamp(m.Sender.ID)
-	return d.submitVideoJob(c, m.Sticker.FileSize, func() {
-		filename, output, err := d.HandleVideoSticker(c, intensity, rampFrom, rampTo)
+	return d.submitVideoJob(c, m.Sticker.FileSize, 0, 0, func() {
+		filename, output, err := d.HandleVideoSticker(c, s)
 		failed := err != nil
 		defer tools.RemoveTemp(filename, failed)
 		defer tools.RemoveTemp(output, failed)
@@ -177,90 +198,39 @@ func (d DistorterBot) handleVideoStickerDistortion(c tb.Context, intensity int) 
 	})
 }
 
-func (d DistorterBot) handleStickerDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handleStickerDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
-	var err error
 	switch {
 	case m.Sticker.Animated:
-		err = d.SendMessageWithRepeater(c, AnimatedStickersUnsupported)
+		return d.SendMessageWithRepeater(c, AnimatedStickersUnsupported)
 	case m.Sticker.Video:
-		err = d.handleVideoStickerDistortion(c, intensity)
+		return d.handleVideoStickerDistortion(c, s)
 	default:
-		err = d.handleRegularStickerDistortion(c, intensity)
+		return d.handleImageDistortion(c, s, func(file tb.File) interface{} {
+			return &tb.Sticker{File: file}
+		})
 	}
-	return err
 }
 
-func (d DistorterBot) handleTextDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handleTextDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
 	if tools.IsBotCommand(m) {
 		return nil
 	}
-	return d.SendMessageWithRepeater(c, distorters.DistortText(c.Text(), intensity))
+	return d.SendMessageWithRepeater(c, distorters.DistortText(c.Text(), s.Intensity))
 }
 
-func (d DistorterBot) handleVideoDistortion(c tb.Context, intensity int) error {
-	m := c.Message()
-	b := c.Bot()
-	rampFrom, rampTo := d.userRamp(m.Sender.ID)
-	return d.submitVideoJob(c, m.Video.FileSize, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c, intensity, rampFrom, rampTo)
-		failed := err != nil
-		defer tools.RemoveTemp(output, failed)
-		if failed {
-			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
-				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
-			}
-			d.logger.Error(err)
-			return
-		}
-
-		distorted := &tb.Video{File: tb.FromDisk(output)}
-		err = d.SendMessageWithRepeater(c, distorted)
-		d.DoneMessageWithRepeater(b, progressMessage, "")
-		if err != nil {
-			d.logger.Error(err)
-		}
-	})
-}
-
-func (d DistorterBot) handleVideoNoteDistortion(c tb.Context, intensity int) error {
-	m := c.Message()
-	b := c.Bot()
-	rampFrom, rampTo := d.userRamp(m.Sender.ID)
-	return d.submitVideoJob(c, m.VideoNote.FileSize, func() {
-		output, progressMessage, err := d.HandleVideoCommon(c, intensity, rampFrom, rampTo)
-		failed := err != nil
-		defer tools.RemoveTemp(output, failed)
-		if failed {
-			if progressMessage != nil && progressMessage.Text != distorters.TooLong {
-				d.logger.Error(err)
-				d.DoneMessageWithRepeater(b, progressMessage, failStatus(err, progressMessage))
-			}
-			return
-		}
-		distorted := &tb.VideoNote{File: tb.FromDisk(output)}
-		err = d.SendMessageWithRepeater(c, distorted)
-		d.DoneMessageWithRepeater(b, progressMessage, "")
-		if err != nil {
-			d.logger.Error(err)
-		}
-	})
-}
-
-func (d DistorterBot) handleVoiceDistortion(c tb.Context, intensity int) error {
+func (d DistorterBot) handleVoiceDistortion(c tb.Context, s stats.Settings) error {
 	m := c.Message()
 	if m.Voice.FileSize > MaxSizeMb {
 		return c.Reply(distorters.TooBig)
 	}
-	filename, err := tools.JustGetTheFile(c.Bot(), m)
+	filename, err := d.download(c)
 	if err != nil {
-		d.logger.Error(err)
 		return err
 	}
 	output := filename + ".ogg"
-	soundMode := d.db.GetUserSoundMode(m.Sender.ID)
-	err = distorters.DistortSound(filename, output, intensity, soundMode)
+	err = distorters.DistortSound(filename, output, s.Intensity, s.SoundMode)
 	failed := err != nil
 	defer tools.RemoveTemp(filename, failed)
 	defer tools.RemoveTemp(output, failed)
@@ -289,22 +259,23 @@ func (d DistorterBot) handleReplyDistortion(c tb.Context) error {
 	update := c.Update()
 	update.Message = original
 	tweakedContext := c.Bot().NewContext(update)
-	intensity := d.db.GetUserIntensity(m.Sender.ID)
+	// Settings always come from whoever sent /distort, not from the original author.
+	s := d.mediaSettings(m.Sender.ID)
 	switch {
 	case original.Animation != nil:
-		return d.handleAnimationDistortion(tweakedContext, intensity)
+		return d.handleAnimationDistortion(tweakedContext, s)
 	case original.Sticker != nil:
-		return d.handleStickerDistortion(tweakedContext, intensity)
+		return d.handleStickerDistortion(tweakedContext, s)
 	case original.Photo != nil:
-		return d.handlePhotoDistortion(tweakedContext, intensity)
+		return d.handlePhotoDistortion(tweakedContext, s)
 	case original.Voice != nil:
-		return d.handleVoiceDistortion(tweakedContext, intensity)
+		return d.handleVoiceDistortion(tweakedContext, s)
 	case original.Video != nil:
-		return d.handleVideoDistortion(tweakedContext, intensity)
+		return d.handleVideoDistortion(tweakedContext, s)
 	case original.VideoNote != nil:
-		return d.handleVideoNoteDistortion(tweakedContext, intensity)
+		return d.handleVideoNoteDistortion(tweakedContext, s)
 	case original.Text != "":
-		return d.handleTextDistortion(tweakedContext, intensity)
+		return d.handleTextDistortion(tweakedContext, s)
 	}
 	return nil
 }
@@ -335,21 +306,20 @@ func (d DistorterBot) handleSound(c tb.Context) error {
 	if m == nil || m.Sender == nil {
 		return nil
 	}
-	payload := strings.ToLower(strings.TrimSpace(m.Payload))
+	payload := strings.TrimSpace(m.Payload)
 	if payload == "" {
-		mode := d.db.GetUserSoundMode(m.Sender.ID)
+		mode := d.mediaSettings(m.Sender.ID).SoundMode
 		return c.Reply(fmt.Sprintf("Sound mode: %s. Options: distort (default vibrato), bassboost (max bass). Send /sound <mode>.", mode))
 	}
-	switch payload {
-	case "distort", "bassboost", "bass", "bass-boost", "bass_boost":
-		if err := d.db.SetUserSoundMode(m.Sender.ID, payload); err != nil {
-			d.logger.Error(err)
-			return c.Reply("Could not save setting.")
-		}
-		return c.Reply(fmt.Sprintf("Sound mode set to %s.", d.db.GetUserSoundMode(m.Sender.ID)))
-	default:
+	mode, ok := distorters.ParseSoundMode(payload)
+	if !ok {
 		return c.Reply("Unknown mode. Use /sound distort or /sound bassboost.")
 	}
+	if err := d.db.SetUserSoundMode(m.Sender.ID, mode); err != nil {
+		d.logger.Error(err)
+		return c.Reply("Could not save setting.")
+	}
+	return c.Reply(fmt.Sprintf("Sound mode set to %s.", mode))
 }
 
 func (d DistorterBot) handleRamp(c tb.Context) error {
@@ -593,24 +563,15 @@ func (d DistorterBot) handleMaintenance(c tb.Context) error {
 	return c.Reply(fmt.Sprintf("Maintenance on: %v", currentMode))
 }
 
-func skipStatCommand(text string) bool {
-	switch {
-	case text == "/daily", text == "/weekly", text == "/monthly", text == "/queue", text == "/maintenance", text == "/update", text == "/status",
-		text == "/ban", text == "/unban", text == "/bannedusers", text == "/unbanrequest", text == "/start",
-		text == "/user", text == "/topusers":
-		return true
-	case strings.HasPrefix(text, "/intensity"), strings.HasPrefix(text, "/ramp"), strings.HasPrefix(text, "/sound"),
-		strings.HasPrefix(text, "/update@"),
-		strings.HasPrefix(text, "/ban"), strings.HasPrefix(text, "/unban"), strings.HasPrefix(text, "/bannedusers"),
-		strings.HasPrefix(text, "/unbanrequest"), strings.HasPrefix(text, "/start@"),
-		strings.HasPrefix(text, "/user"), strings.HasPrefix(text, "/topusers"):
-		return true
-	case strings.HasPrefix(text, "/daily@"), strings.HasPrefix(text, "/weekly@"), strings.HasPrefix(text, "/monthly@"),
-		strings.HasPrefix(text, "/queue@"), strings.HasPrefix(text, "/maintenance@"), strings.HasPrefix(text, "/status@"):
-		return true
-	default:
-		return false
+// recordsStat reports whether a message counts as a distortion request: media and plain text
+// always, commands only when they are /distort (SaveStat then records the replied-to media).
+func recordsStat(m *tb.Message) (record, isCommand bool) {
+	if !tools.IsBotCommand(m) {
+		return true, false
 	}
+	name, _ := splitFirstField(m.Text)
+	name, _, _ = strings.Cut(name, "@")
+	return name == "/distort", true
 }
 
 func main() {
@@ -620,6 +581,10 @@ func main() {
 	}
 	defer lg.Sync() // flushes buffer, if any
 	logger := lg.Sugar()
+	distorters.SetLogger(logger)
+	if dir, err := tools.InitTempDir(); err != nil {
+		logger.Fatalw("temp dir", "dir", dir, "err", err)
+	}
 	db := stats.InitDB(logger)
 	defer db.Close()
 
@@ -655,7 +620,6 @@ func main() {
 		adminID:     adminID,
 		rl:          tools.NewRateLimiter(),
 		logger:      logger,
-		mu:          &sync.Mutex{},
 		graceWg:     &sync.WaitGroup{},
 		videoWorker: tools.NewVideoWorker(3, priorityChats),
 		codec:       codec,
@@ -664,13 +628,13 @@ func main() {
 
 		bannedNotice:  tools.NewThrottle(time.Hour),
 		unbanRequests: tools.NewThrottle(24 * time.Hour),
+		chatRights:    newChatRightsCache(chatRightsTTL),
 	}
 	b.Poller = tb.NewMiddlewarePoller(&tb.LongPoller{Timeout: 10 * time.Second}, func(update *tb.Update) bool {
 		if update.Message == nil {
 			return true // allow callbacks / non-message updates
 		}
 		m := update.Message
-		isCommand := len(m.Entities) > 0 && m.Entities[0].Type == tb.EntityCommand
 		text := update.Message.Text
 		if m.FromGroup() && !tools.IsCommandForBot(m, b.Me.Username) {
 			return false
@@ -692,12 +656,11 @@ func main() {
 			}
 		}
 		if m.FromGroup() {
-			chat, err := b.ChatByID(m.Chat.ID)
+			permissions, err := d.chatRights.get(b, m.Chat.ID, time.Now())
 			if err != nil {
 				logger.Error("Failed to get chat", zap.Int64("chat_id", m.Chat.ID), zap.Error(err))
 				return false
 			}
-			permissions := chat.Permissions
 			if permissions != nil {
 				if !permissions.CanSendMessages {
 					logger.Warn("can't send anything at all", zap.Int64("chat_id", m.Chat.ID))
@@ -708,8 +671,8 @@ func main() {
 				}
 			}
 		}
-		if !skipStatCommand(text) {
-			go db.SaveStat(update.Message, isCommand)
+		if record, isCommand := recordsStat(m); record {
+			db.SaveStat(m, isCommand)
 		}
 		return true
 	})
@@ -738,30 +701,30 @@ func main() {
 	b.Handle(&tb.InlineButton{Unique: "unban"}, d.handleUnbanCallback)
 	b.Handle(&tb.InlineButton{Unique: "userinfo"}, d.handleUserInfoCallback)
 
-	b.Handle("/daily", d.ApplyShutdownMiddleware(func(c tb.Context) error {
+	b.Handle("/daily", func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Daily)
-	}))
+	})
 
-	b.Handle("/weekly", d.ApplyShutdownMiddleware(func(c tb.Context) error {
+	b.Handle("/weekly", func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Weekly)
-	}))
+	})
 
-	b.Handle("/monthly", d.ApplyShutdownMiddleware(func(c tb.Context) error {
+	b.Handle("/monthly", func(c tb.Context) error {
 		return d.handleStatRequest(c, db, stats.Monthly)
-	}))
+	})
 
 	b.Handle("/queue", d.handleQueueStats)
 
 	b.Handle("/maintenance", d.handleMaintenance)
 
 	b.Handle("/distort", d.ApplyShutdownMiddleware(d.handleReplyDistortion))
-	b.Handle(tb.OnAnimation, d.ApplyShutdownMiddleware(d.withIntensity(d.handleAnimationDistortion)))
-	b.Handle(tb.OnSticker, d.ApplyShutdownMiddleware(d.withIntensity(d.handleStickerDistortion)))
-	b.Handle(tb.OnPhoto, d.ApplyShutdownMiddleware(d.withIntensity(d.handlePhotoDistortion)))
-	b.Handle(tb.OnVoice, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVoiceDistortion)))
-	b.Handle(tb.OnVideo, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVideoDistortion)))
-	b.Handle(tb.OnVideoNote, d.ApplyShutdownMiddleware(d.withIntensity(d.handleVideoNoteDistortion)))
-	b.Handle(tb.OnText, d.ApplyShutdownMiddleware(d.withIntensity(d.handleTextDistortion)))
+	b.Handle(tb.OnAnimation, d.ApplyShutdownMiddleware(d.withSettings(d.handleAnimationDistortion)))
+	b.Handle(tb.OnSticker, d.ApplyShutdownMiddleware(d.withSettings(d.handleStickerDistortion)))
+	b.Handle(tb.OnPhoto, d.ApplyShutdownMiddleware(d.withSettings(d.handlePhotoDistortion)))
+	b.Handle(tb.OnVoice, d.ApplyShutdownMiddleware(d.withSettings(d.handleVoiceDistortion)))
+	b.Handle(tb.OnVideo, d.ApplyShutdownMiddleware(d.withSettings(d.handleVideoDistortion)))
+	b.Handle(tb.OnVideoNote, d.ApplyShutdownMiddleware(d.withSettings(d.handleVideoNoteDistortion)))
+	b.Handle(tb.OnText, d.ApplyShutdownMiddleware(d.withSettings(d.handleTextDistortion)))
 
 	go func() {
 		signChan := make(chan os.Signal, 1)

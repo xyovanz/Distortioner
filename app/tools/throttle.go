@@ -7,9 +7,10 @@ import (
 
 // Throttle allows one event per key per interval (e.g. one "you are banned" reply per hour).
 type Throttle struct {
-	interval time.Duration
-	mu       sync.Mutex
-	last     map[int64]time.Time
+	interval  time.Duration
+	mu        sync.Mutex
+	last      map[int64]time.Time
+	lastSweep time.Time
 }
 
 func NewThrottle(interval time.Duration) *Throttle {
@@ -24,7 +25,8 @@ func (t *Throttle) Allow(key int64, now time.Time) bool {
 		return false
 	}
 	t.last[key] = now
-	if len(t.last) > 10_000 {
+	if now.Sub(t.lastSweep) >= t.interval {
+		t.lastSweep = now
 		for k, v := range t.last {
 			if now.Sub(v) >= t.interval {
 				delete(t.last, k)

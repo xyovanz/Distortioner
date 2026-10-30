@@ -7,3 +7,6 @@ README.MD
 LICENSE
 .gitignore
 avatar.jpg
+app/data/
+**/*.sqlite*
+**/update.log

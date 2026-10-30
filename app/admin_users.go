@@ -145,11 +145,12 @@ func (d DistorterBot) userCard(id int64) (string, *tb.ReplyMarkup) {
 		fmt.Fprintf(&b, "Last 30 days: %s\n", formatUserStat(month))
 	}
 
+	settings := d.mediaSettings(id)
 	ramp := "off"
-	if from, to, ok := d.db.GetUserRamp(id); ok {
-		ramp = fmt.Sprintf("%d→%d", from, to)
+	if settings.RampFrom > 0 {
+		ramp = fmt.Sprintf("%d→%d", settings.RampFrom, settings.RampTo)
 	}
-	fmt.Fprintf(&b, "Settings: intensity %d · sound %s · ramp %s\n", d.db.GetUserIntensity(id), d.db.GetUserSoundMode(id), ramp)
+	fmt.Fprintf(&b, "Settings: intensity %d · sound %s · ramp %s\n", settings.Intensity, settings.SoundMode, ramp)
 
 	ban, banned := d.db.GetBan(id)
 	if banned {

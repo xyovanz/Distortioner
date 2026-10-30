@@ -2,7 +2,6 @@ package stats
 
 import (
 	"database/sql"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +23,17 @@ type DistortionerDB struct {
 	// In-memory mirror of banned_users (user_id → reason) so the per-update ban check skips SQLite.
 	bansMu sync.RWMutex
 	bans   map[int64]string
+
+	// Last users-table write per user, so TouchUser doesn't write on every message.
+	touchMu sync.Mutex
+	touched map[int64]touchState
+
+	// Stats rows are queued and written in batches by statWriter.
+	statsMu   sync.RWMutex // guards statsDone against SaveStat after Close
+	statsDone bool
+	statRows  chan statRow
+	flushReq  chan chan struct{}
+	writerEnd chan struct{}
 }
 
 type Stat struct {
@@ -80,8 +90,12 @@ func openDB(logger *zap.SugaredLogger, path string) *DistortionerDB {
 		logger.Fatal(err)
 	}
 	dist := DistortionerDB{
-		db:     db,
-		logger: logger,
+		db:        db,
+		logger:    logger,
+		touched:   make(map[int64]touchState),
+		statRows:  make(chan statRow, statQueueSize),
+		flushReq:  make(chan chan struct{}),
+		writerEnd: make(chan struct{}),
 	}
 	db.SetMaxOpenConns(1)
 
@@ -142,6 +156,7 @@ func openDB(logger *zap.SugaredLogger, path string) *DistortionerDB {
 	if err = dist.loadBans(); err != nil {
 		logger.Fatal(err)
 	}
+	go dist.statWriter()
 
 	return &dist
 }
@@ -177,52 +192,41 @@ func (d *DistortionerDB) SetUserIntensity(userID int64, intensity int) error {
 	return err
 }
 
-const DefaultSoundMode = "distort"
-
-func (d *DistortionerDB) GetUserSoundMode(userID int64) string {
-	var mode sql.NullString
-	err := d.db.QueryRow(`select sound_mode from user_settings where user_id = ?`, userID).Scan(&mode)
-	if err != nil || !mode.Valid || mode.String == "" {
-		return DefaultSoundMode
-	}
-	switch strings.ToLower(mode.String) {
-	case "bassboost", "bass", "bass-boost", "bass_boost":
-		return "bassboost"
-	default:
-		return DefaultSoundMode
-	}
+// Settings is everything a distortion needs from user_settings, read in one query.
+type Settings struct {
+	Intensity int
+	RampFrom  int // 0 when /ramp is off
+	RampTo    int
+	SoundMode string // raw stored value; callers normalize it
 }
 
-func (d *DistortionerDB) SetUserSoundMode(userID int64, mode string) error {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	switch mode {
-	case "bassboost", "bass", "bass-boost", "bass_boost":
-		mode = "bassboost"
-	case "distort", "":
-		mode = DefaultSoundMode
-	default:
-		return fmt.Errorf("unknown sound mode %q", mode)
+func (d *DistortionerDB) GetUserSettings(userID int64) Settings {
+	s := Settings{Intensity: DefaultIntensity}
+	var intensity, rampFrom, rampTo, rampEnabled sql.NullInt64
+	var mode sql.NullString
+	err := d.db.QueryRow(`select intensity, ramp_from, ramp_to, ramp_enabled, sound_mode from user_settings where user_id = ?`, userID).
+		Scan(&intensity, &rampFrom, &rampTo, &rampEnabled, &mode)
+	if err != nil {
+		return s
 	}
+	if v := int(intensity.Int64); intensity.Valid && v >= 1 && v <= 100 {
+		s.Intensity = v
+	}
+	from, to := int(rampFrom.Int64), int(rampTo.Int64)
+	if rampEnabled.Int64 != 0 && rampFrom.Valid && rampTo.Valid && from >= 1 && from <= 100 && to >= 1 && to <= 100 {
+		s.RampFrom, s.RampTo = from, to
+	}
+	s.SoundMode = mode.String
+	return s
+}
+
+// SetUserSoundMode stores an already validated mode.
+func (d *DistortionerDB) SetUserSoundMode(userID int64, mode string) error {
 	_, err := d.db.Exec(`
 		insert into user_settings(user_id, intensity, sound_mode) values(?, ?, ?)
 		on conflict(user_id) do update set sound_mode = excluded.sound_mode`,
 		userID, DefaultIntensity, mode)
 	return err
-}
-
-// GetUserRamp returns progressive from→to when ramp is enabled for this user.
-func (d *DistortionerDB) GetUserRamp(userID int64) (from, to int, ok bool) {
-	var rampFrom, rampTo sql.NullInt64
-	var enabled sql.NullInt64
-	err := d.db.QueryRow(`select ramp_from, ramp_to, ramp_enabled from user_settings where user_id = ?`, userID).Scan(&rampFrom, &rampTo, &enabled)
-	if err != nil || !enabled.Valid || enabled.Int64 == 0 {
-		return 0, 0, false
-	}
-	from, to = int(rampFrom.Int64), int(rampTo.Int64)
-	if !rampFrom.Valid || !rampTo.Valid || from < 1 || from > 100 || to < 1 || to > 100 {
-		return 0, 0, false
-	}
-	return from, to, true
 }
 
 // GetUserRampConfig returns saved endpoints (even if disabled) and whether ramp is on.
@@ -301,8 +305,8 @@ func (d *DistortionerDB) ToggleUserRamp(userID int64) (from, to int, enabled boo
 	return from, to, true, err
 }
 
-// SaveStat records one distortion request. For a /distort reply the media type comes from the
-// replied-to message, but the sender is whoever issued the command.
+// SaveStat queues one distortion request for the batch writer. For a /distort reply the media
+// type comes from the replied-to message, but the sender is whoever issued the command.
 func (d *DistortionerDB) SaveStat(message *tb.Message, isCommand bool) {
 	if message == nil {
 		return
@@ -329,14 +333,11 @@ func (d *DistortionerDB) SaveStat(message *tb.Message, isCommand bool) {
 	case message.Photo != nil:
 		messageType = "photo"
 	}
-	var senderID any
+	row := statRow{chatID: message.Chat.ID, isGroup: message.FromGroup(), at: time.Now(), kind: messageType}
 	if sender != nil {
-		senderID = sender.ID
+		row.senderID = sender.ID
 	}
-	_, err := d.insert.Exec(message.Chat.ID, senderID, message.FromGroup(), time.Now(), messageType)
-	if err != nil {
-		d.logger.Error(err)
-	}
+	d.enqueueStat(row)
 }
 
 func (d *DistortionerDB) GetStat(period Period) (Stat, error) {
@@ -352,5 +353,6 @@ func (d *DistortionerDB) GetStat(period Period) (Stat, error) {
 }
 
 func (d *DistortionerDB) Close() {
+	d.stopStatWriter()
 	d.db.Close()
 }

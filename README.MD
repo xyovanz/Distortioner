@@ -97,7 +97,7 @@ Manual update: `./update.sh` or `./update.sh master` from the repo on the host.
 ## What gets collected
 The bot can see all group messages when privacy mode is off (needed for `/distort`). Only chat IDs and media types are stored for stats — not message text.
 
-Temporary media files are deleted after processing. Set `DISTORTIONER_KEEP_FAILED=1` to keep files when a job fails (debugging).
+Temporary media files live in `DISTORTIONER_TMP_DIR` (default: `<system temp>/distortioner`, i.e. `/tmp/distortioner` in Docker) and are deleted after processing; leftovers from a crash are removed on startup. Mounting it as tmpfs (`--tmpfs /tmp/distortioner`) keeps video frames off the disk at the cost of RAM. Set `DISTORTIONER_KEEP_FAILED=1` to keep files when a job fails (debugging).
 
 ## TODO
 * Distort animated stickers (.tgs / Lottie)

@@ -1,7 +1,6 @@
 package distorters
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/pkg/errors"
@@ -20,11 +19,11 @@ func DistortVideoSticker(filename, output string, intensity, rampFrom, rampTo in
 	if err != nil {
 		return errors.Wrap(err, FailedProbe)
 	}
-	if duration > 30 {
+	if duration > MaxVideoStickerSeconds {
 		return errors.New(TooLong)
 	}
 
-	numberedFileName := fmt.Sprintf("%s/%s%%04d.png", framesDir, filename)
+	numberedFileName := framePattern(framesDir)
 	err = extractFramesFromVideoSticker(frameRateFraction, filename, numberedFileName)
 	if err != nil {
 		return errors.Wrap(err, FailedExtract)
